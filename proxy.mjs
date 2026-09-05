@@ -24,6 +24,7 @@ function loadConfig() {
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
     adminPassword: '',  // 管理页密码；留空则 /admin 返回 403
+    keysFile: 'keys.json',  // key 存储路径；可绝对路径（容器挂载持久化用）
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -45,6 +46,7 @@ function loadConfig() {
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
   if (process.env.ADMIN_PASSWORD) defaults.adminPassword = process.env.ADMIN_PASSWORD;
+  if (process.env.KEYS_FILE) defaults.keysFile = process.env.KEYS_FILE;
 
   return defaults;
 }
@@ -169,7 +171,9 @@ function log(level, msg, data) {
 // keys.json 存 key 池（已被 gitignore，勿提交真实 key）：
 //   { "keys": [{ "name": "主号", "key": "user_...", "note": "" }] }
 // 密码：config.json 的 adminPassword 或环境变量 ADMIN_PASSWORD（留空则禁用管理页）
-const ADMIN_KEYS_FILE = resolve(__dirname, 'keys.json');
+// key 文件路径：config.json 的 keysFile 或环境变量 KEYS_FILE。
+//   容器部署建议挂载数据目录并指向卷内路径，避免 rebuild 丢数据。
+const ADMIN_KEYS_FILE = resolve(__dirname, CFG.keysFile || 'keys.json');
 const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 登录会话 12h
 const adminSessions = new Map(); // sessionToken -> expiresAt
 

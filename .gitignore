@@ -8,4 +8,5 @@ stdout.txt
 stderr.txt
 captured-requests/
 keys.json
+data/
 
