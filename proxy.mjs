@@ -2147,39 +2147,81 @@ function hashKey(key) {
   return crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
 }
 
+// 套餐计划元数据（与官方 CLI 内置表一致）
+// planId 前缀 → 显示名 / 月含额度(USD)
+const ADMIN_PLANS = [
+  { prefix: 'individual-goat', name: 'GOAT', monthlyCredits: 70 },
+  { prefix: 'individual-go', name: 'Go', monthlyCredits: 10 },
+  { prefix: 'individual-pro-v1', name: 'Pro', monthlyCredits: 80 },
+  { prefix: 'individual-pro', name: 'Pro', monthlyCredits: 30 },
+  { prefix: 'individual-provider', name: 'Provider', monthlyCredits: 15 },
+  { prefix: 'individual-max', name: 'Max', monthlyCredits: 150 },
+  { prefix: 'individual-ultra', name: 'Ultra', monthlyCredits: 300 },
+  { prefix: 'teams-pro', name: 'Teams Pro', monthlyCredits: 40 },
+];
+
+function lookupPlan(planId) {
+  if (!planId) return null;
+  const id = String(planId).toLowerCase().replace(/_/g, '-');
+  for (const p of ADMIN_PLANS) {
+    if (id.startsWith(p.prefix)) return { planId, ...p };
+  }
+  return { planId, prefix: '', name: id, monthlyCredits: null };
+}
+
+async function fetchCcJson(keyInfo, path, signal) {
+  const url = new URL(`${CFG.apiBase}${path}`);
+  const res = await fetch(url, {
+    headers: {
+      'Authorization': `Bearer ${keyInfo.key}`,
+      'x-cli-environment': 'production',
+      'x-command-code-version': CC_VERSION,
+      'Content-Type': 'application/json',
+      ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
+    },
+    signal,
+  });
+  const text = await res.text().catch(() => '');
+  let body = {};
+  try { body = text ? JSON.parse(text) : {}; } catch {}
+  return { ok: res.ok, status: res.status, body, error: res.ok ? null : (body?.error?.message || body?.error || `HTTP ${res.status}`) };
+}
+
 async function fetchKeyCredits(keyInfo, force) {
   const cached = adminCache.get(keyInfo.key);
   if (!force && cached) {
     const ttl = cached.data.ok ? ADMIN_CACHE_MS : ADMIN_CACHE_FAIL_MS;
     if (Date.now() - cached.at < ttl) return cached.data;
   }
+  const signal = AbortSignal.timeout(15000);
   try {
-    const url = new URL(`${CFG.apiBase}/alpha/billing/credits`);
-    const res = await fetch(url, {
-      headers: {
-        'Authorization': `Bearer ${keyInfo.key}`,
-        'x-cli-environment': 'production',
-        'x-command-code-version': CC_VERSION,
-        'Content-Type': 'application/json',
-        ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
-      },
-      signal: AbortSignal.timeout(12000),
-    });
-    const text = await res.text().catch(() => '');
-    let body = {};
-    try { body = text ? JSON.parse(text) : {}; } catch {}
+    // 与官方 usage 面板一致：三接口并发
+    const [credits, subscription, summary] = await Promise.all([
+      fetchCcJson(keyInfo, '/alpha/billing/credits', signal),
+      fetchCcJson(keyInfo, '/alpha/billing/subscriptions', signal),
+      fetchCcJson(keyInfo, '/alpha/usage/summary', signal),
+    ]);
+
+    // 主请求（credits）失败视为整体失败；subscription/summary 失败只降级对应块
+    const primary = credits;
     const data = {
-      ok: res.ok,
-      status: res.status,
-      body,
-      error: res.ok ? null : (body?.error?.message || body?.error || `HTTP ${res.status}`),
+      ok: primary.ok,
+      status: primary.status,
+      error: primary.error,
       at: Date.now(),
+      credits: primary.body?.credits ?? null,
+      windowLimits: primary.body?.windowLimits ?? null,
+      subscription: subscription.ok ? (subscription.body?.data ?? subscription.body ?? null) : null,
+      subscriptionError: subscription.ok ? null : (subscription.error || `HTTP ${subscription.status}`),
+      summary: summary.ok ? summary.body : null,
+      summaryError: summary.ok ? null : (summary.error || `HTTP ${summary.status}`),
     };
     adminCache.set(keyInfo.key, { at: Date.now(), data });
-    if (!res.ok) log('warn', 'Admin key query failed', { name: keyInfo.name, status: res.status });
+    if (!primary.ok) log('warn', 'Admin key query failed', { name: keyInfo.name, status: primary.status });
+    else if (!subscription.ok || !summary.ok) log('warn', 'Admin key partial query', { name: keyInfo.name, sub: subscription.status, sum: summary.status });
     return data;
   } catch (e) {
-    const data = { ok: false, status: 0, body: {}, error: e.message || 'network error', at: Date.now() };
+    const data = { ok: false, status: 0, error: e.message || 'network error', at: Date.now(), credits: null, windowLimits: null, subscription: null, summary: null };
     adminCache.set(keyInfo.key, { at: Date.now(), data });
     log('warn', 'Admin key query error', { name: keyInfo.name, error: e.message });
     return data;
@@ -2201,6 +2243,21 @@ async function handleAdminApi(req, res) {
     const keys = loadAdminKeys();
     const settled = await Promise.allSettled(keys.map(async k => {
       const r = await fetchKeyCredits(k, force);
+      const c = r.credits || {};
+      const monthlyRemaining = Math.max(0, Number(c.monthlyCredits) || 0);
+      const purchased = Math.max(0, Number(c.purchasedCredits) || 0);
+      const free = Math.max(0, Number(c.freeCredits) || 0);
+      const totalCost = Math.max(0, Number(r.summary?.totalCost) || 0);
+      const sub = r.subscription || null;
+      const plan = sub ? lookupPlan(sub.planId) : null;
+      const isActive = sub?.status === 'active';
+      const planMonthly = isActive && plan?.monthlyCredits != null ? Number(plan.monthlyCredits) : null;
+      // 官方口径：月度窗口总额 = max(套餐月额度, 剩余月额度) + 已购 + 免费
+      const totalPool = planMonthly != null
+        ? Math.max(planMonthly, monthlyRemaining) + purchased + free
+        : totalCost + monthlyRemaining + purchased + free;
+      const monthlyUsed = Math.max(0, totalPool - (monthlyRemaining + purchased + free));
+      const monthlyPct = totalPool > 0 ? Math.min(100, (monthlyUsed / totalPool) * 100) : 0;
       return {
         name: k.name,
         note: k.note,
@@ -2209,14 +2266,32 @@ async function handleAdminApi(req, res) {
         ok: r.ok,
         status: r.status,
         error: r.error,
-        credits: r.body?.credits ?? null,
-        windowLimits: r.body?.windowLimits ?? null,
+        credits: r.credits,
+        windowLimits: r.windowLimits,
+        // 套餐与月度窗口（官方 projectUsageView 口径）
+        plan: plan ? { id: plan.planId, name: plan.name, monthlyCredits: plan.monthlyCredits } : null,
+        subscriptionStatus: sub?.status ?? null,
+        periodStart: sub?.currentPeriodStart ?? null,
+        periodEnd: sub?.currentPeriodEnd ?? null,
+        daysLeft: sub?.currentPeriodEnd ? Math.max(0, Math.ceil((new Date(sub.currentPeriodEnd).getTime() - Date.now()) / 86400000)) : null,
+        monthly: {
+          used: monthlyUsed,
+          remaining: monthlyRemaining,
+          purchased,
+          free,
+          totalSpent: totalCost,
+          pool: totalPool,
+          pct: monthlyPct,
+        },
+        summaryError: r.summaryError,
+        subscriptionError: r.subscriptionError,
         at: r.at,
       };
     }));
     const results = settled.map(s => (s.status === 'fulfilled' ? s.value : {
       name: '(unknown)', keyHash: '', keyMasked: '', ok: false, status: 0,
-      error: s.reason?.message || 'internal error', credits: null, windowLimits: null, at: Date.now(),
+      error: s.reason?.message || 'internal error', credits: null, windowLimits: null,
+      plan: null, subscriptionStatus: null, monthly: null, at: Date.now(),
     }));
     sendJSON(res, 200, { keys: results, serverTime: Date.now() });
     return;
@@ -2375,6 +2450,9 @@ const ADMIN_PAGE_HTML = `<!doctype html>
   .card-head .nm { font-weight: 600; font-size: 15px; }
   .card-head .nm .note { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
   .card-head .keyid { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 11px; background: rgba(255,255,255,0.04); padding: 3px 8px; border-radius: 6px; }
+  .plan-badge { font-family: var(--mono); font-size: 11px; color: var(--accent); background: rgba(189,242,106,0.1); border: 1px solid rgba(189,242,106,0.3); padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
+  .plan-badge.muted { color: var(--warn); background: rgba(255,180,84,0.08); border-color: rgba(255,180,84,0.3); }
+  .card-head .plan-badge + .keyid { margin-left: auto; }
   .card-body { padding: 4px 16px 14px; }
   .credits { display: flex; gap: 22px; padding: 8px 0 12px; border-bottom: 1px solid rgba(255,255,255,0.05); }
   .cr .lb { color: var(--muted); font-size: 10px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.8px; }
@@ -2499,9 +2577,9 @@ const ADMIN_PAGE_HTML = `<!doctype html>
     var errN = keys.length - okN;
     var monthly = 0, free = 0;
     keys.forEach(function (k) {
-      if (k.ok && k.credits) {
-        monthly += Number(k.credits.monthlyCredits) || 0;
-        free += Number(k.credits.freeCredits) || 0;
+      if (k.ok) {
+        monthly += Number(k.credits?.monthlyCredits) || 0;
+        free += Number(k.credits?.freeCredits) || 0;
       }
     });
     document.getElementById('st-keys').textContent = keys.length;
@@ -2533,6 +2611,24 @@ const ADMIN_PAGE_HTML = `<!doctype html>
         nm.appendChild(note);
       }
       head.appendChild(nm);
+      // 套餐计划徽章
+      if (k.plan) {
+        var pbadge = document.createElement('span');
+        pbadge.className = 'plan-badge';
+        pbadge.textContent = k.plan.name;
+        if (k.subscriptionStatus && k.subscriptionStatus !== 'active') {
+          pbadge.className += ' muted';
+          pbadge.textContent += ' · ' + k.subscriptionStatus;
+        }
+        if (k.plan.monthlyCredits != null) pbadge.title = '月含 $' + k.plan.monthlyCredits;
+        head.appendChild(pbadge);
+      } else if (k.subscriptionError) {
+        var pbadge = document.createElement('span');
+        pbadge.className = 'plan-badge muted';
+        pbadge.textContent = '套餐获取失败';
+        pbadge.title = k.subscriptionError;
+        head.appendChild(pbadge);
+      }
       var keyid = document.createElement('span');
       keyid.className = 'keyid';
       keyid.textContent = k.keyMasked || k.keyHash;
@@ -2565,6 +2661,29 @@ const ADMIN_PAGE_HTML = `<!doctype html>
         cr.appendChild(mk('', 'Purchased', fmt(c.purchasedCredits)));
         cr.appendChild(mk('', 'Free', fmt(c.freeCredits)));
         body.appendChild(cr);
+        // 月度窗口（套餐周期用量）——官方口径：已用/(max(套餐月额,剩余)+已购+免费)
+        if (k.monthly) {
+          var m = k.monthly;
+          var mCap = m.pool > 0 ? m.pool : null;
+          var mReset = k.periodEnd ? fmtTime(k.periodEnd) : null;
+          var mPct = mCap ? Math.min(100, m.pct) : 0;
+          var mCls = mCap && m.used >= mCap ? 'over' : (mPct >= 80 ? 'hot' : '');
+          var mUsedTxt = mCap != null ? fmt(m.used, 2) + ' / ' + fmt(mCap, 2) : fmt(m.used, 2);
+          var mm = document.createElement('div');
+          mm.className = 'meter';
+          mm.innerHTML = '<div class="mrow"><span>' + esc('月度窗口' + (k.plan ? ' · ' + esc(k.plan.name) : '')) + '</span>' +
+            '<span>已用 <b>' + mUsedTxt + '</b></span></div>' +
+            '<div class="bar ' + mCls + '"><i style="width:' + mPct + '%"></i></div>' +
+            '<div class="meta"><span>' + (mReset ? '周期至 ' + mReset + (k.daysLeft != null ? '（剩 ' + k.daysLeft + ' 天）' : '') : '周期信息不可用') +
+            '</span><span>' + (mCap ? mPct.toFixed(0) + '%' : '') + '</span></div>';
+          body.appendChild(mm);
+        } else if (k.summaryError) {
+          var me = document.createElement('div');
+          me.className = 'meta';
+          me.style.cssText = 'padding:8px 0 2px;color:var(--warn)';
+          me.textContent = '月度窗口获取失败（summary 接口 ' + k.summaryError + '）';
+          body.appendChild(me);
+        }
         if (w.fiveHour) body.insertAdjacentHTML('beforeend', meter('5H 窗口', w.fiveHour.used, w.fiveHour.cap, w.fiveHour.resetAt));
         if (w.weekly) body.insertAdjacentHTML('beforeend', meter('Weekly 窗口', w.weekly.used, w.weekly.cap, w.weekly.resetAt));
       }
