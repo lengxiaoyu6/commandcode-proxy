@@ -44,7 +44,7 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
-  if (process.env.ADMIN_PASSWORD !== undefined) defaults.adminPassword = process.env.ADMIN_PASSWORD;
+  if (process.env.ADMIN_PASSWORD) defaults.adminPassword = process.env.ADMIN_PASSWORD;
 
   return defaults;
 }
