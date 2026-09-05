@@ -1,0 +1,14 @@
+{
+  "keys": [
+    {
+      "name": "主号",
+      "key": "user_xxxxxxxxxxxxxxxxxxxxxxxx",
+      "note": ""
+    },
+    {
+      "name": "备用号",
+      "key": "user_yyyyyyyyyyyyyyyyyyyyyyyy",
+      "note": "个人"
+    }
+  ]
+}

@@ -5,7 +5,7 @@
 import http from 'http';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, writeFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -23,6 +23,7 @@ function loadConfig() {
     useProviderModels: true,
     modelRefreshIntervalMs: 5 * 60 * 1000,  // 5 minutes
     zdr: false,
+    adminPassword: '',  // 管理页密码；留空则 /admin 返回 403
   };
 
   const configPath = resolve(__dirname, 'config.json');
@@ -43,6 +44,7 @@ function loadConfig() {
   if (process.env.LOG_FILE) defaults.logFile = process.env.LOG_FILE;
   if (process.env.CC_USE_PROVIDER_MODELS) defaults.useProviderModels = process.env.CC_USE_PROVIDER_MODELS !== 'false';
   if (process.env.CMD_ZDR !== undefined) defaults.zdr = process.env.CMD_ZDR === '1';
+  if (process.env.ADMIN_PASSWORD !== undefined) defaults.adminPassword = process.env.ADMIN_PASSWORD;
 
   return defaults;
 }
@@ -162,6 +164,99 @@ function log(level, msg, data) {
     try { appendFileSync(CFG.logFile, line + '\n', 'utf-8'); } catch {}
   }
 }
+
+// ── 管理页（多 Key 用量查询） ─────────────────────
+// keys.json 存 key 池（已被 gitignore，勿提交真实 key）：
+//   { "keys": [{ "name": "主号", "key": "user_...", "note": "" }] }
+// 密码：config.json 的 adminPassword 或环境变量 ADMIN_PASSWORD（留空则禁用管理页）
+const ADMIN_KEYS_FILE = resolve(__dirname, 'keys.json');
+const ADMIN_SESSION_TTL_MS = 12 * 60 * 60 * 1000; // 登录会话 12h
+const adminSessions = new Map(); // sessionToken -> expiresAt
+
+function loadAdminKeys() {
+  try {
+    if (!existsSync(ADMIN_KEYS_FILE)) return [];
+    const raw = JSON.parse(readFileSync(ADMIN_KEYS_FILE, 'utf-8'));
+    const arr = Array.isArray(raw) ? raw : raw.keys;
+    if (!Array.isArray(arr)) return [];
+    return arr
+      .filter(e => e && typeof e.key === 'string' && /^user_[A-Za-z0-9_-]+/.test(e.key.trim()))
+      .map(e => ({
+        name: String(e.name || e.key.slice(0, 12)),
+        key: e.key.trim(),
+        note: e.note ? String(e.note) : '',
+      }));
+  } catch (e) {
+    log('error', 'Failed to parse keys.json', { error: e.message });
+    return [];
+  }
+}
+
+function saveAdminKeys(keys) {
+  const payload = { keys };
+  try {
+    writeFileSync(ADMIN_KEYS_FILE, JSON.stringify(payload, null, 2) + '\n', 'utf-8');
+    return true;
+  } catch (e) {
+    log('error', 'Failed to write keys.json', { error: e.message });
+    return false;
+  }
+}
+
+function adminEnabled() {
+  return typeof CFG.adminPassword === 'string' && CFG.adminPassword.length > 0;
+}
+
+function adminPasswordOk(req) {
+  const supplied =
+    (req.headers['x-admin-password'] || '').trim()
+    || (req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim()
+    || (parseCookies(req).admin || '');
+  return supplied.length > 0 && supplied === CFG.adminPassword;
+}
+
+function parseCookies(req) {
+  const out = {};
+  const h = req.headers.cookie || '';
+  for (const part of h.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx > 0) {
+      const k = part.slice(0, idx).trim();
+      const v = part.slice(idx + 1).trim();
+      if (k) out[k] = decodeURIComponent(v);
+    }
+  }
+  return out;
+}
+
+function issueAdminSession(res) {
+  const token = randomUUID().replace(/-/g, '');
+  adminSessions.set(token, Date.now() + ADMIN_SESSION_TTL_MS);
+  res.setHeader('Set-Cookie', `admin_session=${token}; HttpOnly; Path=/admin; SameSite=Lax; Max-Age=${Math.floor(ADMIN_SESSION_TTL_MS / 1000)}`);
+  return token;
+}
+
+function adminSessionOk(req) {
+  const token = parseCookies(req).admin_session;
+  if (!token) return false;
+  const exp = adminSessions.get(token);
+  if (!exp) return false;
+  if (Date.now() > exp) {
+    adminSessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+// 定期清理过期 admin 会话
+setInterval(() => {
+  const now = Date.now();
+  let cleaned = 0;
+  for (const [token, exp] of adminSessions) {
+    if (now > exp) { adminSessions.delete(token); cleaned++; }
+  }
+  if (cleaned > 0) log('info', 'Admin session cleanup', { cleaned });
+}, 60 * 60 * 1000);
 
 // ── 会话管理 ───────────────────────────────────────
 // 每个 API Key 独立一个 session，12h 过期 + 1h 随机抖动
@@ -1997,9 +2092,630 @@ async function handleModels(req, res) {
   });
 }
 
+// ── /alpha/billing/credits 透传 ─────────────────────
+// 客户端可用真实 user_ key 查询账号 credits 与 usage window 余量。
+// 完全透传：认证/orgId 归属均由上游按 Authorization 决定，代理不缓存、不聚合。
+async function handleBillingCredits(req, res) {
+  const apiKey = getApiKey(req.headers);
+  if (!apiKey) {
+    sendJSON(res, 401, { error: { message: 'Missing API key. Send in Authorization: Bearer <key> or x-api-key header', type: 'auth_error' } });
+    return;
+  }
+
+  const url = new URL(`${CFG.apiBase}/alpha/billing/credits`);
+  for (const [k, v] of req.url.includes('?') ? new URL(req.url, `http://${req.headers.host || 'localhost'}`).searchParams : []) {
+    url.searchParams.append(k, v);
+  }
+
+  const headers = {
+    'Authorization': `Bearer ${apiKey}`,
+    'x-cli-environment': 'production',
+    'x-command-code-version': CC_VERSION,
+    'Content-Type': 'application/json',
+    ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
+  };
+
+  try {
+    const upstream = await fetch(url, { headers, signal: AbortSignal.timeout(15000) });
+    const text = await upstream.text().catch(() => '');
+    let body;
+    try { body = text ? JSON.parse(text) : {}; } catch { body = { error: { message: text.slice(0, 300) || `Upstream returned ${upstream.status}`, type: 'upstream_error' } }; }
+    log('info', 'Billing credits proxied', { status: upstream.status, query: url.search });
+    sendJSON(res, upstream.status, body);
+  } catch (e) {
+    log('warn', 'Billing credits upstream error', { error: e.name === 'TimeoutError' ? 'timeout' : e.message });
+    sendJSON(res, 502, { error: { message: `Upstream error: ${e.name === 'TimeoutError' ? 'timeout' : e.message}`, type: 'proxy_error' } });
+  }
+}
+
 function handleHealth(req, res) {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('OK');
+}
+
+// ── 管理页后端：多 Key 用量查询 ─────────────────────
+
+const ADMIN_CACHE_MS = 45 * 1000;          // 单 key 上游结果缓存 45s
+const ADMIN_CACHE_FAIL_MS = 8 * 1000;      // 失败结果短缓存，防风暴
+const adminCache = new Map();              // apiKey -> { at, data }
+
+function maskKey(key) {
+  if (key.length <= 13) return key;
+  return `${key.slice(0, 9)}…${key.slice(-4)}`;
+}
+function hashKey(key) {
+  return crypto.createHash('sha256').update(key).digest('hex').slice(0, 16);
+}
+
+async function fetchKeyCredits(keyInfo, force) {
+  const cached = adminCache.get(keyInfo.key);
+  if (!force && cached) {
+    const ttl = cached.data.ok ? ADMIN_CACHE_MS : ADMIN_CACHE_FAIL_MS;
+    if (Date.now() - cached.at < ttl) return cached.data;
+  }
+  try {
+    const url = new URL(`${CFG.apiBase}/alpha/billing/credits`);
+    const res = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${keyInfo.key}`,
+        'x-cli-environment': 'production',
+        'x-command-code-version': CC_VERSION,
+        'Content-Type': 'application/json',
+        ...(CFG.zdr ? { 'x-cmd-zdr': '1' } : {}),
+      },
+      signal: AbortSignal.timeout(12000),
+    });
+    const text = await res.text().catch(() => '');
+    let body = {};
+    try { body = text ? JSON.parse(text) : {}; } catch {}
+    const data = {
+      ok: res.ok,
+      status: res.status,
+      body,
+      error: res.ok ? null : (body?.error?.message || body?.error || `HTTP ${res.status}`),
+      at: Date.now(),
+    };
+    adminCache.set(keyInfo.key, { at: Date.now(), data });
+    if (!res.ok) log('warn', 'Admin key query failed', { name: keyInfo.name, status: res.status });
+    return data;
+  } catch (e) {
+    const data = { ok: false, status: 0, body: {}, error: e.message || 'network error', at: Date.now() };
+    adminCache.set(keyInfo.key, { at: Date.now(), data });
+    log('warn', 'Admin key query error', { name: keyInfo.name, error: e.message });
+    return data;
+  }
+}
+
+async function handleAdminApi(req, res) {
+  if (!adminEnabled()) {
+    sendJSON(res, 403, { error: 'Admin panel disabled. Set adminPassword in config.json or ADMIN_PASSWORD env.' });
+    return;
+  }
+  if (!adminPasswordOk(req) && !adminSessionOk(req)) {
+    sendJSON(res, 401, { error: 'Unauthorized' });
+    return;
+  }
+
+  if (req.method === 'GET') {
+    const force = (new URL(req.url, 'http://localhost')).searchParams.get('force') === '1';
+    const keys = loadAdminKeys();
+    const settled = await Promise.allSettled(keys.map(async k => {
+      const r = await fetchKeyCredits(k, force);
+      return {
+        name: k.name,
+        note: k.note,
+        keyHash: hashKey(k.key),
+        keyMasked: maskKey(k.key),
+        ok: r.ok,
+        status: r.status,
+        error: r.error,
+        credits: r.body?.credits ?? null,
+        windowLimits: r.body?.windowLimits ?? null,
+        at: r.at,
+      };
+    }));
+    const results = settled.map(s => (s.status === 'fulfilled' ? s.value : {
+      name: '(unknown)', keyHash: '', keyMasked: '', ok: false, status: 0,
+      error: s.reason?.message || 'internal error', credits: null, windowLimits: null, at: Date.now(),
+    }));
+    sendJSON(res, 200, { keys: results, serverTime: Date.now() });
+    return;
+  }
+
+  if (req.method === 'POST') {
+    let body;
+    try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON body' }); return; }
+    const action = body?.action;
+    const keys = loadAdminKeys();
+
+    if (action === 'add') {
+      const key = String(body?.key || '').trim();
+      const name = String(body?.name || '').trim();
+      if (!/^user_[A-Za-z0-9_-]+/.test(key)) {
+        sendJSON(res, 400, { error: 'Key must start with user_ and contain only letters, digits, _ or -' });
+        return;
+      }
+      if (keys.some(k => k.key === key)) { sendJSON(res, 400, { error: 'Key already exists' }); return; }
+      keys.push({ name: name || maskKey(key), key, note: String(body?.note || '') });
+      if (!saveAdminKeys(keys)) { sendJSON(res, 500, { error: 'Failed to write keys.json' }); return; }
+      adminCache.delete(key);
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+
+    if (action === 'delete') {
+      const hash = String(body?.keyHash || '');
+      const idx = keys.findIndex(k => hashKey(k.key) === hash);
+      if (idx < 0) { sendJSON(res, 404, { error: 'Key not found' }); return; }
+      const [removed] = keys.splice(idx, 1);
+      saveAdminKeys(keys);
+      adminCache.delete(removed.key);
+      sendJSON(res, 200, { ok: true });
+      return;
+    }
+
+    sendJSON(res, 400, { error: 'Unknown action. Use add or delete.' });
+    return;
+  }
+
+  sendJSON(res, 405, { error: 'Method not allowed' });
+}
+
+async function handleAdminLogin(req, res) {
+  if (!adminEnabled()) {
+    sendJSON(res, 403, { error: 'Admin panel disabled. Set adminPassword in config.json or ADMIN_PASSWORD env.' });
+    return;
+  }
+  let body;
+  try { body = await readBody(req); } catch { sendJSON(res, 400, { error: 'Invalid JSON body' }); return; }
+  const pw = String(body?.password || '');
+  if (pw.length === 0 || pw !== CFG.adminPassword) {
+    sendJSON(res, 401, { error: 'Wrong password' });
+    return;
+  }
+  issueAdminSession(res);
+  sendJSON(res, 200, { ok: true });
+}
+
+function handleAdminLogout(req, res) {
+  const token = parseCookies(req).admin_session;
+  if (token) adminSessions.delete(token);
+  res.setHeader('Set-Cookie', 'admin_session=; HttpOnly; Path=/admin; SameSite=Lax; Max-Age=0');
+  sendJSON(res, 200, { ok: true });
+}
+
+const ADMIN_PAGE_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CommandCode Key 用量控制台</title>
+<style>
+  :root {
+    --bg: #0a0e0a;
+    --panel: #101710;
+    --panel2: #0d130d;
+    --line: #22301f;
+    --text: #d9e5d1;
+    --muted: #7e8f74;
+    --accent: #bdf26a;
+    --accent-dim: #6f9e3c;
+    --cyan: #7fd8f0;
+    --warn: #ffb454;
+    --danger: #ff6b6b;
+    --ok: #bdf26a;
+    --mono: "Cascadia Mono", "SF Mono", "JetBrains Mono", ui-monospace, "IBM Plex Mono", Consolas, monospace;
+    --sans: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { min-height: 100%; }
+  body {
+    background:
+      radial-gradient(900px 500px at 85% -10%, rgba(189,242,106,0.08), transparent 60%),
+      radial-gradient(700px 420px at -10% 110%, rgba(127,216,240,0.06), transparent 60%),
+      repeating-linear-gradient(0deg, rgba(255,255,255,0.012) 0 1px, transparent 1px 4px),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 26px; }
+  .logo { width: 12px; height: 12px; background: var(--accent); box-shadow: 0 0 14px rgba(189,242,106,0.7); transform: rotate(45deg); margin-right: 4px; align-self: center; }
+  h1 { font-size: 20px; font-weight: 600; letter-spacing: 0.5px; font-family: var(--mono); }
+  h1 small { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  .sub { color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .pill { font-size: 11px; padding: 3px 10px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); font-family: var(--mono); background: rgba(255,255,255,0.02); }
+  .pill.ok { color: var(--ok); border-color: rgba(189,242,106,0.35); }
+  .pill.err { color: var(--danger); border-color: rgba(255,107,107,0.4); }
+  .gate {
+    max-width: 400px; margin: 12vh auto 0; background: var(--panel);
+    border: 1px solid var(--line); border-radius: 14px; padding: 32px 30px;
+    box-shadow: 0 24px 60px rgba(0,0,0,0.5);
+  }
+  .gate h2 { font-size: 16px; margin-bottom: 6px; font-family: var(--mono); }
+  .gate p { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  .gate input, .addrow input {
+    width: 100%; background: var(--panel2); border: 1px solid var(--line); color: var(--text);
+    padding: 10px 12px; border-radius: 8px; font-size: 13px; font-family: var(--mono); outline: none;
+  }
+  .gate input:focus, .addrow input:focus { border-color: var(--accent-dim); }
+  .gate .err { color: var(--danger); font-size: 12px; margin-top: 10px; min-height: 18px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; }
+  .stat .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 1px; font-family: var(--mono); }
+  .stat .v { font-size: 22px; font-weight: 600; font-family: var(--mono); margin-top: 4px; }
+  .stat .v.good { color: var(--ok); } .stat .v.bad { color: var(--danger); }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .btn {
+    background: rgba(189,242,106,0.1); color: var(--accent); border: 1px solid rgba(189,242,106,0.35);
+    padding: 8px 16px; border-radius: 8px; font-size: 13px; cursor: pointer; font-family: var(--mono);
+    transition: background 0.15s;
+  }
+  .btn:hover { background: rgba(189,242,106,0.2); }
+  .btn.ghost { background: transparent; color: var(--muted); border-color: var(--line); }
+  .btn.ghost:hover { color: var(--text); border-color: var(--muted); }
+  .btn.danger { background: transparent; color: var(--danger); border-color: rgba(255,107,107,0.4); }
+  .btn.danger:hover { background: rgba(255,107,107,0.12); }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .statusline { margin-left: auto; color: var(--muted); font-size: 12px; font-family: var(--mono); }
+  .statusline .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); margin-right: 6px; animation: pulse 1.6s infinite; }
+  .statusline .dot.err { background: var(--danger); }
+  .statusline .dot.idle { background: var(--muted); animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .addrow { display: grid; grid-template-columns: 1fr 2fr 1.2fr auto; gap: 10px; background: var(--panel); border: 1px dashed var(--line); border-radius: 12px; padding: 12px; margin-bottom: 20px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; position: relative; transition: border-color 0.2s; }
+  .card:hover { border-color: #33452f; }
+  .card.err { border-color: rgba(255,107,107,0.45); }
+  .card-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px 10px; }
+  .led { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--accent); box-shadow: 0 0 8px rgba(189,242,106,0.8); }
+  .led.err { background: var(--danger); box-shadow: 0 0 8px rgba(255,107,107,0.8); }
+  .card-head .nm { font-weight: 600; font-size: 15px; }
+  .card-head .nm .note { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
+  .card-head .keyid { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 11px; background: rgba(255,255,255,0.04); padding: 3px 8px; border-radius: 6px; }
+  .card-body { padding: 4px 16px 14px; }
+  .credits { display: flex; gap: 22px; padding: 8px 0 12px; border-bottom: 1px solid rgba(255,255,255,0.05); }
+  .cr .lb { color: var(--muted); font-size: 10px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.8px; }
+  .cr .num { font-family: var(--mono); font-size: 16px; margin-top: 2px; font-weight: 600; }
+  .cr.main .num { font-size: 22px; color: var(--accent); }
+  .meter { margin-top: 12px; }
+  .meter .mrow { display: flex; justify-content: space-between; font-size: 11px; font-family: var(--mono); margin-bottom: 5px; color: var(--muted); }
+  .meter .mrow b { color: var(--text); font-weight: 500; }
+  .bar { height: 6px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; }
+  .bar i { display: block; height: 100%; border-radius: 99px; background: var(--accent-dim); transition: width 0.4s; }
+  .bar.hot i { background: var(--warn); }
+  .bar.over i { background: var(--danger); }
+  .meta { display: flex; justify-content: space-between; margin-top: 10px; color: var(--muted); font-size: 10.5px; font-family: var(--mono); }
+  .meta .warn { color: var(--warn); }
+  .card-foot { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.05); align-items: center; }
+  .errbox { color: var(--danger); font-size: 12px; padding: 4px 0 10px; font-family: var(--mono); word-break: break-all; }
+  .empty { text-align: center; color: var(--muted); padding: 60px 20px; border: 1px dashed var(--line); border-radius: 14px; font-family: var(--mono); }
+  .foot { margin-top: 30px; color: var(--muted); font-size: 11px; font-family: var(--mono); text-align: center; opacity: 0.7; }
+  [hidden] { display: none !important; }
+  @media (max-width: 640px) {
+    .cards { grid-template-columns: 1fr; }
+    .addrow { grid-template-columns: 1fr; }
+    .statusline { margin-left: 0; width: 100%; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="logo"></span>
+    <h1>KEY USAGE<small>CommandCode 多 Key 用量控制台</small></h1>
+    <span class="sub" id="ver"></span>
+    <span class="pill" id="envpill">prod</span>
+  </header>
+
+  <div class="gate" id="gate">
+    <h2>访问受限</h2>
+    <p>输入管理员密码以查看 Key 用量</p>
+    <input type="password" id="pw" placeholder="Password" autocomplete="current-password">
+    <div class="err" id="gateerr"></div>
+    <br>
+    <button class="btn" id="loginbtn" style="width:100%">进入控制台</button>
+  </div>
+
+  <div id="dash" hidden>
+    <div class="stats">
+      <div class="stat"><div class="k">Keys</div><div class="v" id="st-keys">–</div></div>
+      <div class="stat"><div class="k">正常</div><div class="v good" id="st-ok">–</div></div>
+      <div class="stat"><div class="k">异常</div><div class="v bad" id="st-err">–</div></div>
+      <div class="stat"><div class="k">月度额度累计</div><div class="v" id="st-monthly">–</div></div>
+      <div class="stat"><div class="k">免费额度累计</div><div class="v" id="st-free">–</div></div>
+    </div>
+
+    <div class="toolbar">
+      <button class="btn" id="refresh">⟳ 刷新</button>
+      <button class="btn ghost" id="logout">退出</button>
+      <span class="statusline"><span class="dot idle" id="sdot"></span><span id="slabel">就绪</span></span>
+    </div>
+
+    <div class="addrow">
+      <input type="text" id="add-name" placeholder="备注名（可选）">
+      <input type="text" id="add-key" placeholder="user_ 开头的新 Key">
+      <input type="text" id="add-note" placeholder="说明（可选）">
+      <button class="btn" id="addbtn">添加</button>
+    </div>
+
+    <div class="cards" id="cards"></div>
+    <div class="empty" id="empty" hidden>还没有 Key。在上方输入 user_ Key 开始监控。</div>
+    <div class="foot" id="foot"></div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+  var gate = document.getElementById('gate');
+  var dash = document.getElementById('dash');
+  var timer = null;
+  var loading = false;
+
+  function fmt(n, d) {
+    if (n === null || n === undefined || isNaN(Number(n))) return '–';
+    return Number(n).toFixed(d === undefined ? 3 : d);
+  }
+  function fmtTime(ms) {
+    if (!ms) return '–';
+    var d = new Date(Number(ms));
+    if (isNaN(d)) return '–';
+    var p = function (x) { return String(x).padStart(2, '0'); };
+    return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function fmtAgo(ms) {
+    if (!ms) return '–';
+    var s = Math.max(0, Math.round((Date.now() - Number(ms)) / 1000));
+    if (s < 60) return s + 's 前';
+    if (s < 3600) return Math.round(s / 60) + 'm 前';
+    return Math.round(s / 3600) + 'h 前';
+  }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+    });
+  }
+  function setStatus(txt, cls) {
+    var d = document.getElementById('sdot');
+    d.className = 'dot ' + (cls || 'idle');
+    document.getElementById('slabel').textContent = txt;
+  }
+
+  function meter(label, used, cap, resetAt) {
+    var pct = cap > 0 ? Math.min(100, used / cap * 100) : 0;
+    var cls = cap > 0 && used >= cap ? 'over' : (pct >= 80 ? 'hot' : '');
+    var resetTxt = resetAt ? '重置 ' + fmtTime(resetAt) : '无重置时间';
+    return '<div class="meter"><div class="mrow"><span>' + esc(label) + '</span><span>已用 <b>' + fmt(used, 2) + '</b> / ' + fmt(cap, 2) + '</span></div>' +
+      '<div class="bar ' + cls + '"><i style="width:' + pct + '%"></i></div>' +
+      '<div class="meta"><span>' + resetTxt + '</span><span class="' + (used >= cap ? 'warn' : '') + '">' + pct.toFixed(0) + '%</span></div></div>';
+  }
+
+  function render(data) {
+    var keys = data.keys || [];
+    var okN = keys.filter(function (k) { return k.ok; }).length;
+    var errN = keys.length - okN;
+    var monthly = 0, free = 0;
+    keys.forEach(function (k) {
+      if (k.ok && k.credits) {
+        monthly += Number(k.credits.monthlyCredits) || 0;
+        free += Number(k.credits.freeCredits) || 0;
+      }
+    });
+    document.getElementById('st-keys').textContent = keys.length;
+    document.getElementById('st-ok').textContent = okN;
+    document.getElementById('st-err').textContent = errN;
+    document.getElementById('st-monthly').textContent = monthly.toFixed(3);
+    document.getElementById('st-free').textContent = free.toFixed(3);
+
+    var cards = document.getElementById('cards');
+    cards.innerHTML = '';
+    document.getElementById('empty').hidden = keys.length > 0;
+
+    keys.forEach(function (k) {
+      var card = document.createElement('div');
+      card.className = 'card' + (k.ok ? '' : ' err');
+
+      var head = document.createElement('div');
+      head.className = 'card-head';
+      var led = document.createElement('span');
+      led.className = 'led' + (k.ok ? '' : ' err');
+      head.appendChild(led);
+      var nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = k.name || '(未命名)';
+      if (k.note) {
+        var note = document.createElement('span');
+        note.className = 'note';
+        note.textContent = k.note;
+        nm.appendChild(note);
+      }
+      head.appendChild(nm);
+      var keyid = document.createElement('span');
+      keyid.className = 'keyid';
+      keyid.textContent = k.keyMasked || k.keyHash;
+      keyid.title = 'Key Hash: ' + k.keyHash;
+      head.appendChild(keyid);
+      card.appendChild(head);
+
+      var body = document.createElement('div');
+      body.className = 'card-body';
+
+      if (!k.ok) {
+        var eb = document.createElement('div');
+        eb.className = 'errbox';
+        eb.textContent = '查询失败 [' + (k.status || 'ERR') + '] ' + (k.error || '');
+        body.appendChild(eb);
+      } else {
+        var c = k.credits || {};
+        var w = k.windowLimits || {};
+        var cr = document.createElement('div');
+        cr.className = 'credits';
+        var mk = function (cls, lb, num) {
+          var d = document.createElement('div');
+          d.className = 'cr' + (cls ? ' ' + cls : '');
+          var l = document.createElement('div'); l.className = 'lb'; l.textContent = lb;
+          var n = document.createElement('div'); n.className = 'num'; n.textContent = num;
+          d.appendChild(l); d.appendChild(n);
+          return d;
+        };
+        cr.appendChild(mk('main', 'Monthly', fmt(c.monthlyCredits)));
+        cr.appendChild(mk('', 'Purchased', fmt(c.purchasedCredits)));
+        cr.appendChild(mk('', 'Free', fmt(c.freeCredits)));
+        body.appendChild(cr);
+        if (w.fiveHour) body.insertAdjacentHTML('beforeend', meter('5H 窗口', w.fiveHour.used, w.fiveHour.cap, w.fiveHour.resetAt));
+        if (w.weekly) body.insertAdjacentHTML('beforeend', meter('Weekly 窗口', w.weekly.used, w.weekly.cap, w.weekly.resetAt));
+      }
+      card.appendChild(body);
+
+      var foot = document.createElement('div');
+      foot.className = 'card-foot';
+      var when = document.createElement('span');
+      when.style.cssText = 'color:var(--muted);font-family:var(--mono);font-size:10.5px';
+      when.textContent = '更新 ' + fmtAgo(k.at);
+      foot.appendChild(when);
+      var del = document.createElement('button');
+      del.className = 'btn danger';
+      del.style.cssText = 'margin-left:auto;padding:5px 12px;font-size:12px';
+      del.textContent = '删除';
+      del.addEventListener('click', function () {
+        if (!confirm('删除 Key ' + (k.name || '') + ' ？此操作只移除本地监控，不影响账号。')) return;
+        post({ action: 'delete', keyHash: k.keyHash }, function (r) {
+          if (r && r.ok) { setStatus('已删除', 'ok'); load(true); }
+        });
+      });
+      foot.appendChild(del);
+      card.appendChild(foot);
+      cards.appendChild(card);
+    });
+  }
+
+  function post(body, cb) {
+    fetch('/admin/api/keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      credentials: 'same-origin',
+    }).then(function (r) {
+      return r.json().then(function (d) {
+        if (r.status === 401) { showGate(); return null; }
+        if (r.status === 403) { alert('管理页未启用：请在 config.json 配置 adminPassword'); return null; }
+        return d;
+      });
+    }).then(function (d) {
+      if (!d) return;
+      if (d.error) { alert('操作失败：' + d.error); cb(null); return; }
+      cb(d);
+    }).catch(function () { alert('网络错误'); cb(null); });
+  }
+
+  function load(force) {
+    // 强制刷新时忽略进行中的请求，避免 loading 门闩吞掉关键刷新
+    if (loading && !force) return;
+    if (force) loading = false;
+    loading = true;
+    setStatus('查询中…', '');
+    fetch('/admin/api/keys' + (force ? '?force=1' : ''), { credentials: 'same-origin' })
+      .then(function (r) {
+        if (r.status === 401) { showGate(); throw new Error('auth'); }
+        if (r.status === 403) { alert('管理页未启用：请在 config.json 配置 adminPassword'); throw new Error('disabled'); }
+        return r.json();
+      })
+      .then(function (d) {
+        if (d && d.keys) { render(d); setStatus('更新于 ' + fmtAgo(d.serverTime), 'ok'); }
+        else { setStatus('无数据', 'err'); }
+      })
+      .catch(function (e) {
+        if (e && e.message !== 'auth' && e.message !== 'disabled') setStatus('加载失败', 'err');
+      })
+      .then(function () { loading = false; });
+  }
+
+  function showGate() {
+    clearInterval(timer);
+    dash.hidden = true;
+    gate.hidden = false;
+    setStatus('就绪', 'idle');
+  }
+  function enter() {
+    gate.hidden = true;
+    dash.hidden = false;
+    load(true);
+    clearInterval(timer);
+    timer = setInterval(function () { load(false); }, 45000);
+  }
+
+  document.getElementById('loginbtn').addEventListener('click', function () {
+    var pw = document.getElementById('pw').value;
+    document.getElementById('gateerr').textContent = '';
+    if (!pw) { document.getElementById('gateerr').textContent = '请输入密码'; return; }
+    fetch('/admin/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pw }),
+      credentials: 'same-origin',
+    }).then(function (r) {
+      if (r.ok) { document.getElementById('pw').value = ''; enter(); return null; }
+      return r.json().then(function (d) { throw new Error(d.error || '密码错误'); });
+    }).catch(function (e) {
+      document.getElementById('gateerr').textContent = e.message || '密码错误';
+    });
+  });
+  document.getElementById('pw').addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') document.getElementById('loginbtn').click();
+  });
+  document.getElementById('refresh').addEventListener('click', function () { load(true); });
+  document.getElementById('logout').addEventListener('click', function () {
+    fetch('/admin/logout', { method: 'POST', credentials: 'same-origin' }).then(function () { showGate(); });
+  });
+  document.getElementById('addbtn').addEventListener('click', function () {
+    var btn = document.getElementById('addbtn');
+    var key = document.getElementById('add-key').value.trim();
+    if (!key) { alert('请输入 Key'); return; }
+    if (key.indexOf('user_') !== 0) { alert('Key 必须以 user_ 开头'); return; }
+    var payload = {
+      action: 'add',
+      name: document.getElementById('add-name').value.trim(),
+      key: key,
+      note: document.getElementById('add-note').value.trim(),
+    };
+    btn.disabled = true;
+    btn.textContent = '添加中…';
+    post(payload, function (r) {
+      btn.disabled = false;
+      btn.textContent = '添加';
+      if (r && r.ok) {
+        document.getElementById('add-key').value = '';
+        document.getElementById('add-name').value = '';
+        document.getElementById('add-note').value = '';
+        setStatus('已添加 ' + (payload.name || key.slice(0, 9) + '…') + '，查询中…', 'ok');
+        load(true);
+      }
+    });
+  });
+  document.getElementById('ver').textContent = 'cli ' + navigator.userAgent.indexOf('admin') > -1 ? '' : '';
+  document.getElementById('envpill').textContent = 'local proxy';
+
+  // 首次加载即探活：未登录显示密码门，已登录直接进
+  fetch('/admin/api/keys', { credentials: 'same-origin' }).then(function (r) {
+    if (r.status === 200) { enter(); }
+    else { gate.hidden = false; }
+  }).catch(function () { gate.hidden = false; });
+})();
+</script>
+</body>
+</html>
+`;
+
+function handleAdminPage(req, res) {
+  if (!adminEnabled()) {
+    sendJSON(res, 403, { error: 'Admin panel disabled. Set adminPassword in config.json or ADMIN_PASSWORD env.' });
+    return;
+  }
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+  res.end(ADMIN_PAGE_HTML);
 }
 
 // ── 服务器 ──────────────────────────────────────────
@@ -2025,6 +2741,16 @@ const server = http.createServer(async (req, res) => {
       await handleMessages(req, res);
     } else if (url.pathname === '/v1/models' && req.method === 'GET') {
       await handleModels(req, res);
+    } else if (url.pathname === '/alpha/billing/credits' && req.method === 'GET') {
+      await handleBillingCredits(req, res);
+    } else if (url.pathname === '/admin' || url.pathname === '/admin/') {
+      handleAdminPage(req, res);
+    } else if (url.pathname === '/admin/api/keys' && (req.method === 'GET' || req.method === 'POST')) {
+      await handleAdminApi(req, res);
+    } else if (url.pathname === '/admin/login' && req.method === 'POST') {
+      await handleAdminLogin(req, res);
+    } else if (url.pathname === '/admin/logout' && req.method === 'POST') {
+      handleAdminLogout(req, res);
     } else if (url.pathname === '/health' || url.pathname === '/') {
       handleHealth(req, res);
     } else {
