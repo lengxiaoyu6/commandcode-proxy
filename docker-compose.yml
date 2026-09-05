@@ -7,6 +7,11 @@ services:
       - "${PROXY_PORT:-3050}:3050"
     environment:
       PORT: "3050"
+      # 密码优先从环境变量注入；不设置时回退读容器内 config.json
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
+    volumes:
+      # 挂载宿主机 config.json，改密码/端口无需重新 build
+      - ./config.json:/app/config.json:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "--spider", "http://127.0.0.1:3050/health"]
