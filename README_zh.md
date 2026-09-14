@@ -4,7 +4,7 @@
 
 将 Command Code API 转换为 OpenAI / Anthropic 兼容接口的反代代理。单文件，零外部依赖。
 
-基于对官方 CLI 网络流量的分析，精确还原了 Command Code API 的请求协议（含设备指纹与生命周期预请求），并实现了多层兼容适配。
+逐条对齐官方 npm 包源码（`command-code@1.53.1`；`dist/cli.mjs` 只是压缩、**没有混淆**）—— 详见 `PROTOCOL-FACTS-1.53.1.md`：
 
 **完整功能**：OpenAI Chat Completions + Anthropic Messages API | 流式/非流式输出 | 工具调用 (tool_use) | 多模态图片输入 | 推理强度 (reasoning_effort) | 动态模型列表 | 缓存命中指标 | 设备指纹伪装（per-key 绑定、自动刷新）| `x-api-key` 鉴权（Anthropic SDK）| 客户端断连检测（上游中止） | 零输出 → 429 自动重试 | 连续超时 → 429 自动重试 | 隐私保护日志
 
@@ -33,7 +33,8 @@ commandcode/
 ├── config.json           # 端口 / 日志路径等
 ├── LICENSE               # MIT License
 ├── package.json          # npm start / npm run dev
-├── proxy.mjs             # 单文件核心代理（~1900 行）
+├── proxy.mjs             # 单文件核心代理（~3950 行）
+├── keys.example.json     # 管理页 key 池模板（复制为 keys.json 使用）
 ├── Dockerfile            # 容器构建文件（node:22-alpine）
 ├── docker-compose.yml    # 容器编排
 ├── .dockerignore         # 构建上下文排除规则
@@ -61,6 +62,8 @@ commandcode/
 | `useProviderModels` | `true` | 从 Provider API 动态拉取模型列表 |
 | `modelRefreshIntervalMs` | `300000` | 模型列表缓存刷新间隔（5min） |
 | `zdr` | `false` | 请求 Command Code 使用 ZDR-only 路由 |
+| `adminPassword` | `""` | 管理页密码；留空则 `/admin` 返回 403（等于关闭管理页）|
+| `keysFile` | `keys.json` | Key 池存储路径；可填绝对路径（容器挂载持久化用）|
 
 ### 环境变量
 
@@ -72,13 +75,48 @@ commandcode/
 | `PROJECT_SLUG` | `projectSlug` |
 | `LOG_FILE` | `logFile` |
 | `CC_USE_PROVIDER_MODELS` | `useProviderModels` |
+| `CC_STREAM_IDLE_MS` | 流式上游读空闲超时（默认 `30000`）|
+| `CC_NONSTREAM_IDLE_MS` | 非流式上游读空闲超时（默认 `90000`）|
+| `CC_MAX_INFLIGHT` | 进程内在途请求上限（默认 `0` = 不限）|
 | `CMD_ZDR` | `zdr`（`1` 开启） |
+| `ADMIN_PASSWORD` | `adminPassword` | 
+| `KEYS_FILE` | `keysFile` | 
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
 header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数据留存和上游可用性仍由上游服务决定。
 
 **请求体上限**：独立于 `config.json` —— 超过 **100MB** 的请求会被拒绝并返回 `HTTP 413`（连接保持可排空，不会直接 reset）。可用 `CC_MAX_BODY_MB`（正整数，单位 MB）覆盖。
+
+> ⚠️ **内存放大**：请求体在转发到上游前会存在多份副本，实测峰值 ≈ body 大小 × **5.1~7.4**（7MB→+52MB、20MB→+116MB；被 `413` 拒绝的请求只要 ×1.05）。因此默认 `CC_MAX_BODY_MB=100` 意味着**单个请求**最坏可吃 ~550MB，且该上限是每请求的、不是全局的。详见[内存与部署](#内存与部署)。
+
+## 管理面板
+
+内置的密码保护面板，用于集中查看**多个 API Key** 的额度与用量，免去逐个手工查询。
+
+**启用**：设置 `adminPassword`（或环境变量 `ADMIN_PASSWORD`）。留空则 `/admin` 直接返回 403，等于关闭该功能；数据接口同样受保护，不会泄露 key。
+
+**Key 池**：由 `keysFile`（默认 `keys.json`）提供，格式见仓库内 `keys.example.json`：
+
+```json
+{
+  "keys": [
+    { "name": "主号", "key": "user_xxxxxxxx", "note": "" }
+  ]
+}
+```
+
+`keys.json` 与 `data/` 已加入 `.gitignore`，真实 key 不会被提交。
+
+**访问**：浏览器打开 `http://<host>:<port>/admin`，首次进入为登录网关页（内容不含任何 key），登录后有 12 小时的 `HttpOnly` 会话 Cookie。也支持 `x-admin-password` 请求头或 `Authorization: Bearer <密码>` 直接访问接口。
+
+**接口**：`GET /admin/api/keys` 返回全部 key 的聚合用量；`?force=1` 跳过 45 秒缓存；`POST` 可增删改 key 池。
+
+**面板内容**：每个 key 的套餐徽章（GOAT / Pro / Max 等，依据 planId 前缀映射）、月窗口额度、credits 余量、订阅与用量汇总。上游结果缓存 45 秒（失败结果缓存 8 秒以防请求风暴）。
+
+> 🔐 **容器部署务必挂载持久化卷**：`keys.json` 与 `config.json` 位于容器内，重建镜像会丢失。`docker-compose.yml` 已将 `config.json` 与数据目录挂入卷，升级前请确认挂载配置仍在。
+
+> ℹ️ 面板查询走 `/alpha/billing/{credits,subscriptions}` 与 `/alpha/usage/summary` 三个上游接口（并发），身份头与官方 usage 面板一致；这些是查询接口，不会产生推理请求。
 
 ## API 接口
 
@@ -352,14 +390,14 @@ Anthropic SDK 通过 `x-api-key` 头鉴权——代理已原生支持（无需 `
 
 | 机制 | 实现 |
 |------|------|
-| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；随机指纹池（15 种 CPU、全球时区）、SHA-256 哈希、per-key 绑定，每 8h+2h 抖动刷新 |
-| **生命周期声明** | 会话初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`） |
+| **设备指纹** | 每个 Key 首次请求前发送 `POST /alpha/fingerprint/record`；信号值（Windows MachineGuid 形状、真实形状的 MAC、`DESKTOP-xxxxxx` 主机名）由 API key **确定性派生**，并按 CLI 的算法哈希 —— 同一个 key 永远报告同一台设备：重启、内存回收、多实例都一致（用 `CC_FINGERPRINT_SALT` 成批换身份）|
+| **生命周期声明** | Key 初始化时与指纹并行发送 `POST /alpha/lifecycle-events`（`cli_session_exists`，metadata `{sessionId, cliVersion, mode, os}`）|
 | **按 Key 分 Session** | 每个 API Key 独立 session，12h 过期 + 1h 随机抖动 |
-| **动态版本号** | `x-command-code-version` 从 npm registry 自动拉取（24h 刷新） |
-| **CLI 信封格式** | config/memory/taste/skills/permissionMode/params |
+| **协议版本号** | `x-command-code-version` 报**实际实现的协议版本**（当前 `1.53.1`）；npm 上有新版本只打**漂移告警**，不会静默改版本号 |
+| **CLI 信封格式** | 9 键：`config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
-| **环境标识** | `x-cli-environment: production`、`x-co-flag: "false"`、`x-taste-learning: "false"` |
-| **Project Slug** | 从 sessionId 生成的 `x-project-slug`（与真实 CLI 格式一致） |
+| **环境标识** | `x-cli-environment: production`、`x-taste-learning: "false"`、`User-Agent: cli` |
+| **Project Slug** | `x-project-slug` = `slugify(process.cwd())`，与 `config.workingDir` 同源 |
 | **思考强度** | `reasoning_effort` 透传 (low/medium/high/max) |
 | **API Key 格式验证** | 对 `Authorization: Bearer` 或 `x-api-key` 用正则 `user_[a-zA-Z0-9_-]+` 提取，自动清理多余路径/前缀，`sk-xxx` 等非 `user_` 格式拒 |
 | **流式超时保护** | 流式 30s、非流式 90s → 429 + SDK 自动重试 |
@@ -462,6 +500,143 @@ npm run docker:build:multi
 | `PORT` | `3050` | 容器内监听端口 |
 | `PROXY_PORT` | `3050` | 主机映射端口（仅 compose） |
 | `CC_MAX_BODY_MB` | `100` | 请求体大小上限（MB），超限请求返回 `HTTP 413` |
+| `CC_CLIENT_DRAIN_TIMEOUT_MS` | 空（禁用）| 下游背压阻塞超过该毫秒数则断开该客户端并中止上游请求，见[僵死连接](#僵死连接既不读也不断开) |
+| `CC_STREAM_IDLE_MS` | `30000` | 流式上游读空闲超时（毫秒），见[上游空闲超时](#上游空闲超时) |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式上游读空闲超时（毫秒）|
+| `CC_MAX_INFLIGHT` | `0`（不限）| 进程内在途请求上限，超限返回 `503` + `Retry-After`，见[在途上限](#在途请求上限可选) |
+
+## 在途请求上限（可选）
+
+**默认关闭**（`CC_MAX_INFLIGHT` 未设置 = 不限制并发），既有行为不变。
+
+本项目定位是**纯反代层**，并发控制属于下游 —— 按 IP / 按 key 的限流请用反向代理（见[内存与部署](#内存与部署)里的 `limit_conn`）。
+本项**不是**那套方案的替代品，只为「不挂反代裸跑」（Dockerfile 与 `npm start` 都支持这种用法）提供一个**进程内、仅全局**的兜底：
+
+```bash
+CC_MAX_INFLIGHT=32 npm start    # 最多同时处理 32 个请求
+```
+
+超限时快速返回 `503` + `Retry-After: 5` + `type: server_busy` —— OpenAI / Anthropic 官方 SDK 认得这个组合会自动退避重试，而不是拿到连接被重置。`/health` 与 `/` 不计入、也不受限制，避免探活与编排器因业务繁忙收到 503。
+
+**为什么需要它**：内存 = `在途数 × (0.13MB + 5.5 × body_MB)`。`CC_MAX_BODY_MB` 只管住**单请求**量级，乘数无人管 —— 默认 100MB 时 N 个并发最坏可达 N × 550MB。
+
+> ⚠️ 开启本项**不等于**内存安全：32 × 550MB 仍远超小机器容量。要拿到硬性上界，需**同时**下调 `CC_MAX_BODY_MB`。
+
+## 上游空闲超时
+
+两个上游读空闲看门狗，超时后返回 `429`（带 `retry_after`）让 SDK 自动重试：
+
+| 环境变量 | 默认 | 作用于 |
+|---|---|---|
+| `CC_STREAM_IDLE_MS` | `30000` | 流式请求 |
+| `CC_NONSTREAM_IDLE_MS` | `90000` | 非流式请求 |
+
+**语义**：只计「`reader.read()` 的等待时间」，每收到一个 chunk 就重置 —— **不是整个请求的总时长**。
+只要上游在持续吐流就不会触发，哪怕单个请求已经跑了几十分钟。
+
+**默认值与官方 CLI 不一致，这是已知取舍**（[#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)）：
+官方 CLI 对上游**没有任何** idle timeout —— 反编译 `command-code@1.50.0` 可见所有 `createApiClient({ baseUrl })` 调用点都未传 `timeout`，实测 700+ 秒的停顿可正常完成。
+本代理保留 30s 是为了兜住真正死掉的连接；代价是**推理模型的长思考停顿可能被误杀**。
+
+若遇到「`429 Response timeout`」「`zero output tokens`」且日志里 `elapsedMs ≈ 30000`、`bytesReceived = 0`，
+说明是看门狗误杀了 prefill / 首 token 阶段的正常停顿 —— 调大即可：
+
+```bash
+CC_STREAM_IDLE_MS=300000 npm start      # 5 分钟
+```
+
+> ⚠️ 误杀的成本不止一次失败：被 abort 后返回 `429 + retry_after`，SDK 会自动重试，
+> 而重试等于**完整重发整个上下文**，长会话下每次误杀都要重付一次全量 prefill。
+
+## 内存与部署
+
+> 数据来自 [issue #20](https://github.com/MAXeaglet/commandcode-proxy/issues/20) 的实测复现（Node v24，loopback mock 上游）。
+
+单请求内存开销的经验公式：
+
+```
+RSS ≈ 70 MB + 在途请求数 × (0.13 MB + 5.5 × body_MB)
+```
+
+### 流式响应已做背压
+
+`res.write()` 返回 `false`（socket 写缓冲超过 `highWaterMark`）时会暂停读取上游，响应不再在内存中无界堆积：
+
+| 场景（200MB 上游流，客户端发完请求即停止读取） | 峰值 RSS 增量 |
+|---|---|
+| 修复前 | **+586 MB**（66 → 652 MB）|
+| 修复后 | **+4 MB**（背压一路传回上游，上游只吐出 ~8MB 即停住）|
+
+这不只是恶意客户端问题 —— 弱网/移动端、客户端卡在工具执行、客户端已放弃但 TCP 还没发 RST，都会触发。
+
+### 请求体放大 ~5.5×
+
+body 在转发到上游前同时存在多份副本：`chunks[]` / `Buffer.concat` / utf8 字符串 / `JSON.parse` 对象树 / `buildCcRequest` 重建对象树 / `JSON.stringify` 序列化体。
+
+| body | 上限 | 峰值增量 | 结果 |
+|---|---|---|---|
+| 7 MB | 100 MB | +52 MB（7.4×）| 200 |
+| 20 MB | 100 MB | +116 MB（5.8×）| 200 |
+| 20 MB | 8 MB | +21 MB（1.05×）| **413** |
+
+启动时若隐含最坏峰值 ≥ 500MB，日志会输出 `warn` 提示。上限是**按请求**的，proxy 自身没有在途限流 —— 公网部署必须在反向代理层补上。
+
+### nginx 反代建议
+
+`client_max_body_size` 在 nginx 拒绝时，body 根本不会进入 Node 进程：
+
+```nginx
+map $http_authorization $cc_key { default $http_authorization; "" $http_x_api_key; }
+map "" $cc_global_key { default "global"; }
+
+limit_conn_zone $binary_remote_addr zone=cc_ip:10m;
+limit_conn_zone $cc_key             zone=cc_key:10m;
+limit_conn_zone $cc_global_key      zone=cc_global:10m;
+
+location /v1/ {
+    client_max_body_size 4m;   # 需 <= CC_MAX_BODY_MB
+    limit_conn cc_ip     8;
+    limit_conn cc_key    4;
+    limit_conn cc_global 32;   # 这一项就是内存天花板
+    limit_conn_status 429;
+    proxy_pass http://127.0.0.1:3050;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_buffering off;
+    proxy_read_timeout 300s;   # 需大于 30s 的流空闲超时
+}
+```
+
+### 僵死连接（既不读也不断开）
+
+背压生效后，客户端**既不读也不断开**时该请求会连带上游连接一直挂着。实测残留在途成本：
+
+| 僵死连接数 | RSS 增量 | 上游连接持有 |
+|---|---|---|
+| 1 | +5 MB | 1 |
+| 10 | +45 MB | 10 |
+| 50 | +248 MB | 50（**永久持有**）|
+
+特性是**有界、不泄漏、客户端断开即回收**（RSS 曲线完全持平），但**连接数本身无上限**。
+
+默认**不处理**，因为僵死客户端与「卡在工具执行的合法客户端」在协议层无法区分；且官方 CLI 对上游没有任何 idle timeout（见 [#19](https://github.com/MAXeaglet/commandcode-proxy/issues/19)），贸然加超时会重蹈「误杀健康请求」。
+
+需要封顶时启用（opt-in）：
+
+```bash
+# 下游持续阻塞超过 60s 才断开，正常客户端只要在推进 drain 就不会触发
+CC_CLIENT_DRAIN_TIMEOUT_MS=60000 npm start
+```
+
+启用后实测（50 个僵死连接）：上游连接持有数由 **50（永久）→ 0**，且丢弃后**不会**继续抽干上游。
+
+更稳妥的封顶仍在反向代理层（`limit_conn`），因为只有它知道该部署能承受多少并发。
+
+### 其它注意事项
+
+- **`logFile` 是同步写**（`appendFileSync`），公网负载下会阻塞事件循环 —— 建议保持留空，从 stdout 收集。
+- **systemd 兜底**：配 `MemoryMax=` 与 `NODE_OPTIONS=--max-old-space-size=`，让超限杀掉 proxy 而不是 `sshd`/`nginx`。
+- **多账号 + 多实例**：`sessionStore` / `keyStateStore` 是进程内 `Map`。同一个 API key 打到两个实例会得到两个不同 session 与**两个不同设备指纹**，上游会看到「一个账号在多台机器上」。横向扩展请按 API key 做一致性哈希（`hash $cc_key consistent`），不要轮询。
 
 ## 免责声明
 
