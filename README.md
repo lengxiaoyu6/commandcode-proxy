@@ -81,6 +81,8 @@ commandcode/
 | `CMD_ZDR` | `zdr` (`1` to enable) |
 | `ADMIN_PASSWORD` | `adminPassword` |
 | `KEYS_FILE` | `keysFile` |
+| `CC_ADMIN_TIMEOUT_MS` | Admin panel per-request upstream timeout (default `20000`, ms) |
+| `CC_ADMIN_CONCURRENCY` | Admin panel upstream concurrency cap (default `4`) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header
@@ -119,6 +121,8 @@ A built-in password-protected panel for viewing quota and usage across **multipl
 **Copy a key**: each row has a **Copy** button that fetches the full key and writes it to the clipboard, briefly showing "已复制". Secure contexts (https or localhost) use `navigator.clipboard`; browsing over `http://<lan-ip>:<port>/admin` is an insecure context and falls back to `execCommand`. Both paths are verified by test.
 
 **What it shows**: per-key plan badge (GOAT / Pro / Max and friends, mapped from the planId prefix), monthly window quota, remaining credits, and subscription/usage summary. Upstream results are cached for 45 seconds (failures for 8 seconds, to absorb request storms).
+
+**Fault tolerance**: the three upstream calls settle **independently** — a key is marked failed only when `credits` itself fails. If `subscriptions` or `usage` fails, just that block degrades (the plan badge shows a fetch failure, the monthly window reports its period is unavailable) while the credit figures already retrieved keep rendering. Each request gets its own timeout, 20 seconds by default, tunable via `CC_ADMIN_TIMEOUT_MS`; upstream concurrency is capped at 4 by default via `CC_ADMIN_CONCURRENCY` — without that cap, a burst of concurrent lookups across many keys tends to trip upstream rate limiting, which surfaces as timeouts.
 
 > 🔐 **Mount a persistent volume in containers**: `keys.json` and `config.json` live inside the container and are lost on image rebuild. `docker-compose.yml` already mounts `config.json` plus a data directory; confirm those mounts survive before upgrading.
 

@@ -81,6 +81,8 @@ commandcode/
 | `CMD_ZDR` | `zdr`（`1` 开启） |
 | `ADMIN_PASSWORD` | `adminPassword` | 
 | `KEYS_FILE` | `keysFile` | 
+| `CC_ADMIN_TIMEOUT_MS` | 管理页单个上游查询超时（默认 `20000`，单位毫秒）|
+| `CC_ADMIN_CONCURRENCY` | 管理页发往上游的并发上限（默认 `4`）|
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
@@ -117,6 +119,8 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 **复制 Key**：列表每行提供「复制」按钮，点击后取回完整 Key 写入剪贴板，按钮短暂变为「已复制」。安全上下文（https 或 localhost）走 `navigator.clipboard`；通过 `http://<内网IP>:<端口>/admin` 访问时是非安全上下文，自动降级为 `execCommand`，两条路径均已实测验证。
 
 **面板内容**：每个 key 的套餐徽章（GOAT / Pro / Max 等，依据 planId 前缀映射）、月窗口额度、credits 余量、订阅与用量汇总。上游结果缓存 45 秒（失败结果缓存 8 秒以防请求风暴）。
+
+**容错**：三个上游接口**各自独立结算**——只有 `credits` 失败才把该 key 标为「查询失败」，`subscriptions` 或 `usage` 失败只会让对应区块降级（套餐显示「套餐获取失败」、月窗口显示「周期信息不可用」），已拿到的额度数据照常展示。每个请求有独立超时，默认 20 秒，可用 `CC_ADMIN_TIMEOUT_MS` 调整；发往上游的查询并发默认上限 4，可用 `CC_ADMIN_CONCURRENCY` 调整——多 key 时若不限流，瞬时的并发请求反而容易触发上游限流并表现为超时。
 
 > 🔐 **容器部署务必挂载持久化卷**：`keys.json` 与 `config.json` 位于容器内，重建镜像会丢失。`docker-compose.yml` 已将 `config.json` 与数据目录挂入卷，升级前请确认挂载配置仍在。
 

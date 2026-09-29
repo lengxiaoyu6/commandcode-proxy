@@ -3359,6 +3359,45 @@ const ADMIN_CACHE_MS = 45 * 1000;          // 单 key 上游结果缓存 45s
 const ADMIN_CACHE_FAIL_MS = 8 * 1000;      // 失败结果短缓存，防风暴
 const adminCache = new Map();              // apiKey -> { at, data }
 
+// 单个上游查询的超时（毫秒）。上游慢或网络抖动时可调大：CC_ADMIN_TIMEOUT_MS=30000
+const ADMIN_TIMEOUT_MS = (() => {
+  const n = Number(process.env.CC_ADMIN_TIMEOUT_MS);
+  return Number.isFinite(n) && n > 0 ? n : 20000;
+})();
+
+// 发往上游的 admin 查询并发上限：多 key 时每个 key 又要并发 3 个接口，
+// 不限流会瞬时打满上游、反而更容易触发限流与超时。CC_ADMIN_CONCURRENCY 可调。
+const ADMIN_UPSTREAM_CONCURRENCY = (() => {
+  const n = Number(process.env.CC_ADMIN_CONCURRENCY);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 4;
+})();
+
+function createLimiter(max) {
+  let active = 0;
+  const queue = [];
+  const pump = () => {
+    if (active >= max || queue.length === 0) return;
+    active++;
+    const job = queue.shift();
+    job.fn().then(job.resolve, job.reject).finally(() => { active--; pump(); });
+  };
+  return (fn) => new Promise((resolve, reject) => {
+    queue.push({ fn, resolve, reject });
+    pump();
+  });
+}
+const adminUpstreamLimit = createLimiter(ADMIN_UPSTREAM_CONCURRENCY);
+
+// fetch 层异常转可读文案；超时是最常见的一种，单独识别出来
+function describeFetchError(e, timeoutMs) {
+  const name = e?.name || '';
+  const msg = e?.message || '';
+  if (name === 'TimeoutError' || name === 'AbortError' || /abort|timeout/i.test(msg)) {
+    return `上游超时（${Math.round(timeoutMs / 1000)}s 无响应）`;
+  }
+  return msg || 'network error';
+}
+
 function maskKey(key) {
   if (key.length <= 13) return key;
   return `${key.slice(0, 9)}…${key.slice(-4)}`;
@@ -3417,39 +3456,45 @@ async function fetchKeyCredits(keyInfo, force) {
     const ttl = cached.data.ok ? ADMIN_CACHE_MS : ADMIN_CACHE_FAIL_MS;
     if (Date.now() - cached.at < ttl) return cached.data;
   }
-  const signal = AbortSignal.timeout(15000);
-  try {
-    // 与官方 usage 面板一致：三接口并发
-    const [credits, subscription, summary] = await Promise.all([
-      fetchCcJson(keyInfo, '/alpha/billing/credits', signal),
-      fetchCcJson(keyInfo, '/alpha/billing/subscriptions', signal),
-      fetchCcJson(keyInfo, '/alpha/usage/summary', signal),
-    ]);
 
-    // 主请求（credits）失败视为整体失败；subscription/summary 失败只降级对应块
-    const primary = credits;
-    const data = {
-      ok: primary.ok,
-      status: primary.status,
-      error: primary.error,
-      at: Date.now(),
-      credits: primary.body?.credits ?? null,
-      windowLimits: primary.body?.windowLimits ?? null,
-      subscription: subscription.ok ? (subscription.body?.data ?? subscription.body ?? null) : null,
-      subscriptionError: subscription.ok ? null : (subscription.error || `HTTP ${subscription.status}`),
-      summary: summary.ok ? summary.body : null,
-      summaryError: summary.ok ? null : (summary.error || `HTTP ${summary.status}`),
-    };
-    adminCache.set(keyInfo.key, { at: Date.now(), data });
-    if (!primary.ok) log('warn', 'Admin key query failed', { name: keyInfo.name, status: primary.status });
-    else if (!subscription.ok || !summary.ok) log('warn', 'Admin key partial query', { name: keyInfo.name, sub: subscription.status, sum: summary.status });
-    return data;
-  } catch (e) {
-    const data = { ok: false, status: 0, error: e.message || 'network error', at: Date.now(), credits: null, windowLimits: null, subscription: null, summary: null };
-    adminCache.set(keyInfo.key, { at: Date.now(), data });
-    log('warn', 'Admin key query error', { name: keyInfo.name, error: e.message });
-    return data;
-  }
+  // 三个接口各自独立结算。此前三者共享一个 signal 且走 Promise.all，
+  // 只要任一接口慢或失败，整个 key 就报"查询失败"——即使 credits 已经成功，
+  // 与下面"只有 credits 失败才算整体失败"的意图正好相反。
+  // 超时信号在进入限流队列后才创建，排队等待不计入超时。
+  const settle = (path) => adminUpstreamLimit(
+    () => fetchCcJson(keyInfo, path, AbortSignal.timeout(ADMIN_TIMEOUT_MS))
+  ).catch(e => ({
+    ok: false,
+    status: 0,
+    error: describeFetchError(e, ADMIN_TIMEOUT_MS),
+    body: {},
+  }));
+
+  // 与官方 usage 面板一致：三接口并发
+  const [credits, subscription, summary] = await Promise.all([
+    settle('/alpha/billing/credits'),
+    settle('/alpha/billing/subscriptions'),
+    settle('/alpha/usage/summary'),
+  ]);
+
+  // 主请求（credits）失败视为整体失败；subscription/summary 失败只降级对应块
+  const primary = credits;
+  const data = {
+    ok: primary.ok,
+    status: primary.status,
+    error: primary.error,
+    at: Date.now(),
+    credits: primary.body?.credits ?? null,
+    windowLimits: primary.body?.windowLimits ?? null,
+    subscription: subscription.ok ? (subscription.body?.data ?? subscription.body ?? null) : null,
+    subscriptionError: subscription.ok ? null : (subscription.error || `HTTP ${subscription.status}`),
+    summary: summary.ok ? summary.body : null,
+    summaryError: summary.ok ? null : (summary.error || `HTTP ${summary.status}`),
+  };
+  adminCache.set(keyInfo.key, { at: Date.now(), data });
+  if (!primary.ok) log('warn', 'Admin key query failed', { name: keyInfo.name, status: primary.status, error: primary.error });
+  else if (!subscription.ok || !summary.ok) log('warn', 'Admin key partial query', { name: keyInfo.name, sub: subscription.status || subscription.error, sum: summary.status || summary.error });
+  return data;
 }
 
 async function handleAdminApi(req, res) {
@@ -4018,7 +4063,7 @@ const ADMIN_PAGE_HTML = `<!doctype html>
         tdErr.colSpan = 4;
         var eb = document.createElement('div');
         eb.className = 'ecell';
-        eb.textContent = '查询失败 [' + (k.status || 'ERR') + '] ' + (k.error || '');
+        eb.textContent = '查询失败' + (k.status ? ' [' + k.status + ']' : '') + ' ' + (k.error || '');
         eb.title = eb.textContent;
         tdErr.appendChild(eb);
         tr.appendChild(tdErr);
