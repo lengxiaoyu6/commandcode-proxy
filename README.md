@@ -112,7 +112,11 @@ A built-in password-protected panel for viewing quota and usage across **multipl
 
 **Access**: open `http://<host>:<port>/admin` in a browser. Unauthenticated requests receive a login gate page containing no key data; a successful login issues a 12-hour `HttpOnly` session cookie. The API also accepts an `x-admin-password` header or `Authorization: Bearer <password>`.
 
-**Endpoints**: `GET /admin/api/keys` returns aggregated usage for every key; add `?force=1` to bypass the 45-second cache; `POST` adds, updates, or removes keys.
+**Endpoints**: `GET /admin/api/keys` returns aggregated usage for every key (**masked values only, never plaintext**); add `?force=1` to bypass the 45-second cache. `POST` accepts three actions: `add`, `delete`, and `reveal` (fetch the plaintext of a single key by `keyHash`).
+
+`reveal` exists solely to back the table's **Copy** button. It returns one key at a time, sets `Cache-Control: no-store` so intermediaries cannot cache it, and writes an audit log line on every call that records the name and hash but never the plaintext.
+
+**Copy a key**: each row has a **Copy** button that fetches the full key and writes it to the clipboard, briefly showing "已复制". Secure contexts (https or localhost) use `navigator.clipboard`; browsing over `http://<lan-ip>:<port>/admin` is an insecure context and falls back to `execCommand`. Both paths are verified by test.
 
 **What it shows**: per-key plan badge (GOAT / Pro / Max and friends, mapped from the planId prefix), monthly window quota, remaining credits, and subscription/usage summary. Upstream results are cached for 45 seconds (failures for 8 seconds, to absorb request storms).
 

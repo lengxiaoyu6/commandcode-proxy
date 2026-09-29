@@ -110,7 +110,11 @@ header。该开关只是请求 Command Code 使用 ZDR-only 路由，实际数�
 
 **访问**：浏览器打开 `http://<host>:<port>/admin`，首次进入为登录网关页（内容不含任何 key），登录后有 12 小时的 `HttpOnly` 会话 Cookie。也支持 `x-admin-password` 请求头或 `Authorization: Bearer <密码>` 直接访问接口。
 
-**接口**：`GET /admin/api/keys` 返回全部 key 的聚合用量；`?force=1` 跳过 45 秒缓存；`POST` 可增删改 key 池。
+**接口**：`GET /admin/api/keys` 返回全部 key 的聚合用量（**只含掩码，不含明文**）；`?force=1` 跳过 45 秒缓存。`POST` 支持三个动作：`add` 添加、`delete` 删除、`reveal` 按 `keyHash` 单独取回明文。
+
+`reveal` 只服务于表格里的「复制」按钮，一次仅返回一个 key，响应带 `Cache-Control: no-store` 防止中间层缓存，且每次调用都会记一条审计日志（只记名称与 hash，绝不落盘明文）。
+
+**复制 Key**：列表每行提供「复制」按钮，点击后取回完整 Key 写入剪贴板，按钮短暂变为「已复制」。安全上下文（https 或 localhost）走 `navigator.clipboard`；通过 `http://<内网IP>:<端口>/admin` 访问时是非安全上下文，自动降级为 `execCommand`，两条路径均已实测验证。
 
 **面板内容**：每个 key 的套餐徽章（GOAT / Pro / Max 等，依据 planId 前缀映射）、月窗口额度、credits 余量、订阅与用量汇总。上游结果缓存 45 秒（失败结果缓存 8 秒以防请求风暴）。
 

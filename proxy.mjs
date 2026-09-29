@@ -3330,7 +3330,19 @@ async function handleAdminApi(req, res) {
       return;
     }
 
-    sendJSON(res, 400, { error: 'Unknown action. Use add or delete.' });
+    if (action === 'reveal') {
+      // 明文只按需返回单个（列表仍只下发掩码），且禁止任何中间层缓存。
+      // 审计日志只记 name 与 hash，绝不落盘明文。
+      const hash = String(body?.keyHash || '');
+      const target = keys.find(k => hashKey(k.key) === hash);
+      if (!target) { sendJSON(res, 404, { error: 'Key not found' }); return; }
+      res.setHeader('Cache-Control', 'no-store');
+      log('info', 'Admin revealed key', { name: target.name, keyHash: hash });
+      sendJSON(res, 200, { ok: true, name: target.name, key: target.key });
+      return;
+    }
+
+    sendJSON(res, 400, { error: 'Unknown action. Use add, delete or reveal.' });
     return;
   }
 
@@ -3441,42 +3453,52 @@ const ADMIN_PAGE_HTML = `<!doctype html>
   .statusline .dot.idle { background: var(--muted); animation: none; }
   @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.25; } }
   .addrow { display: grid; grid-template-columns: 1fr 2fr 1.2fr auto; gap: 10px; background: var(--panel); border: 1px dashed var(--line); border-radius: 12px; padding: 12px; margin-bottom: 20px; }
-  .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; }
-  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; overflow: hidden; position: relative; transition: border-color 0.2s; }
-  .card:hover { border-color: #33452f; }
-  .card.err { border-color: rgba(255,107,107,0.45); }
-  .card-head { display: flex; align-items: center; gap: 10px; padding: 14px 16px 10px; }
-  .led { width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--accent); box-shadow: 0 0 8px rgba(189,242,106,0.8); }
+  .led { display: block; width: 9px; height: 9px; border-radius: 50%; flex: none; background: var(--accent); box-shadow: 0 0 8px rgba(189,242,106,0.8); }
   .led.err { background: var(--danger); box-shadow: 0 0 8px rgba(255,107,107,0.8); }
-  .card-head .nm { font-weight: 600; font-size: 15px; }
-  .card-head .nm .note { color: var(--muted); font-weight: 400; font-size: 12px; margin-left: 8px; }
-  .card-head .keyid { margin-left: auto; color: var(--muted); font-family: var(--mono); font-size: 11px; background: rgba(255,255,255,0.04); padding: 3px 8px; border-radius: 6px; }
   .plan-badge { font-family: var(--mono); font-size: 11px; color: var(--accent); background: rgba(189,242,106,0.1); border: 1px solid rgba(189,242,106,0.3); padding: 3px 9px; border-radius: 99px; white-space: nowrap; }
   .plan-badge.muted { color: var(--warn); background: rgba(255,180,84,0.08); border-color: rgba(255,180,84,0.3); }
-  .card-head .plan-badge + .keyid { margin-left: auto; }
-  .card-body { padding: 4px 16px 14px; }
-  .credits { display: flex; gap: 22px; padding: 8px 0 12px; border-bottom: 1px solid rgba(255,255,255,0.05); }
-  .cr .lb { color: var(--muted); font-size: 10px; font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.8px; }
-  .cr .num { font-family: var(--mono); font-size: 16px; margin-top: 2px; font-weight: 600; }
-  .cr.main .num { font-size: 22px; color: var(--accent); }
-  .meter { margin-top: 12px; }
-  .meter .mrow { display: flex; justify-content: space-between; font-size: 11px; font-family: var(--mono); margin-bottom: 5px; color: var(--muted); }
-  .meter .mrow b { color: var(--text); font-weight: 500; }
-  .bar { height: 6px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; }
+  .tablewrap { border: 1px solid var(--line); border-radius: 12px; background: var(--panel); overflow: hidden; }
+  .scrollx { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  thead th {
+    background: var(--panel2); color: var(--muted); font-family: var(--mono); font-size: 10px;
+    text-transform: uppercase; letter-spacing: 0.9px; font-weight: 500; text-align: left;
+    padding: 9px 7px; white-space: nowrap; border-bottom: 1px solid var(--line);
+  }
+  thead th.r { text-align: right; }
+  tbody td { padding: 7px; border-bottom: 1px solid rgba(255,255,255,0.045); vertical-align: middle; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: rgba(255,255,255,0.022); }
+  tbody tr.rowerr td { background: rgba(255,107,107,0.05); }
+  .nmcell { display: flex; align-items: baseline; gap: 7px; }
+  .nmcell .nm { font-weight: 600; font-size: 13px; white-space: nowrap; }
+  .nmcell .note { color: var(--muted); font-weight: 400; font-size: 11px; white-space: nowrap; }
+  .keyid { color: var(--muted); font-family: var(--mono); font-size: 10.5px; white-space: nowrap; }
+  .num { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; text-align: right; }
+  .num.hi { color: var(--accent); font-weight: 600; }
+  .num.na { color: #4a5743; }
+  .na { color: #4a5743; font-family: var(--mono); font-size: 12.5px; }
+  .win { min-width: 98px; }
+  .win .wtop { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; font-family: var(--mono); font-size: 11px; }
+  .win .wtop .used { white-space: nowrap; }
+  .win .wtop .pct { color: var(--muted); }
+  .win .wsub { color: var(--muted); font-family: var(--mono); font-size: 9.5px; margin-top: 3px; white-space: nowrap; }
+  .win .wsub.warn { color: var(--warn); }
+  .bar { height: 4px; background: rgba(255,255,255,0.06); border-radius: 99px; overflow: hidden; margin-top: 5px; }
   .bar i { display: block; height: 100%; border-radius: 99px; background: var(--accent-dim); transition: width 0.4s; }
   .bar.hot i { background: var(--warn); }
   .bar.over i { background: var(--danger); }
-  .meta { display: flex; justify-content: space-between; margin-top: 10px; color: var(--muted); font-size: 10.5px; font-family: var(--mono); }
-  .meta .warn { color: var(--warn); }
-  .card-foot { display: flex; gap: 8px; padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.05); align-items: center; }
-  .errbox { color: var(--danger); font-size: 12px; padding: 4px 0 10px; font-family: var(--mono); word-break: break-all; }
+  .when { color: var(--muted); font-family: var(--mono); font-size: 10.5px; white-space: nowrap; }
+  .ecell { color: var(--danger); font-family: var(--mono); font-size: 11px; max-width: 460px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .opcell { display: flex; gap: 6px; justify-content: flex-end; }
+  .rowdel { padding: 4px 8px; font-size: 11px; white-space: nowrap; }
   .empty { text-align: center; color: var(--muted); padding: 60px 20px; border: 1px dashed var(--line); border-radius: 14px; font-family: var(--mono); }
   .foot { margin-top: 30px; color: var(--muted); font-size: 11px; font-family: var(--mono); text-align: center; opacity: 0.7; }
   [hidden] { display: none !important; }
-  @media (max-width: 640px) {
-    .cards { grid-template-columns: 1fr; }
+  @media (max-width: 760px) {
     .addrow { grid-template-columns: 1fr; }
     .statusline { margin-left: 0; width: 100%; }
+    .wrap { padding: 20px 12px 50px; }
   }
 </style>
 </head>
@@ -3520,7 +3542,29 @@ const ADMIN_PAGE_HTML = `<!doctype html>
       <button class="btn" id="addbtn">添加</button>
     </div>
 
-    <div class="cards" id="cards"></div>
+    <div class="tablewrap" id="tablewrap" hidden>
+      <div class="scrollx">
+        <table>
+          <thead>
+            <tr>
+              <th style="width:24px"></th>
+              <th>名称</th>
+              <th>套餐</th>
+              <th>Key</th>
+              <th class="r">Monthly</th>
+              <th class="r">已购</th>
+              <th class="r">免费</th>
+              <th>月度窗口</th>
+              <th>5H 窗口</th>
+              <th>Weekly 窗口</th>
+              <th>更新</th>
+              <th class="r">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tb"></tbody>
+        </table>
+      </div>
+    </div>
     <div class="empty" id="empty" hidden>还没有 Key。在上方输入 user_ Key 开始监控。</div>
     <div class="foot" id="foot"></div>
   </div>
@@ -3545,6 +3589,18 @@ const ADMIN_PAGE_HTML = `<!doctype html>
     var p = function (x) { return String(x).padStart(2, '0'); };
     return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
   }
+  function fmtTimeShort(ms) {
+    var d = new Date(Number(ms));
+    if (!ms || isNaN(d)) return '–';
+    var p = function (x) { return String(x).padStart(2, '0'); };
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+  }
+  function fmtDateShort(ms) {
+    var d = new Date(Number(ms));
+    if (!ms || isNaN(d)) return '–';
+    var p = function (x) { return String(x).padStart(2, '0'); };
+    return p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
   function fmtAgo(ms) {
     if (!ms) return '–';
     var s = Math.max(0, Math.round((Date.now() - Number(ms)) / 1000));
@@ -3552,24 +3608,79 @@ const ADMIN_PAGE_HTML = `<!doctype html>
     if (s < 3600) return Math.round(s / 60) + 'm 前';
     return Math.round(s / 3600) + 'h 前';
   }
-  function esc(s) {
-    return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) {
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
-    });
-  }
   function setStatus(txt, cls) {
     var d = document.getElementById('sdot');
     d.className = 'dot ' + (cls || 'idle');
     document.getElementById('slabel').textContent = txt;
   }
 
-  function meter(label, used, cap, resetAt) {
-    var pct = cap > 0 ? Math.min(100, used / cap * 100) : 0;
-    var cls = cap > 0 && used >= cap ? 'over' : (pct >= 80 ? 'hot' : '');
-    var resetTxt = resetAt ? '重置 ' + fmtTime(resetAt) : '无重置时间';
-    return '<div class="meter"><div class="mrow"><span>' + esc(label) + '</span><span>已用 <b>' + fmt(used, 2) + '</b> / ' + fmt(cap, 2) + '</span></div>' +
-      '<div class="bar ' + cls + '"><i style="width:' + pct + '%"></i></div>' +
-      '<div class="meta"><span>' + resetTxt + '</span><span class="' + (used >= cap ? 'warn' : '') + '">' + pct.toFixed(0) + '%</span></div></div>';
+  // navigator.clipboard 只在安全上下文（https / localhost）可用；
+  // 从 http://<内网IP>:3050 访问时它是 undefined，必须走 execCommand 兜底。
+  function copyText(text) {
+    if (navigator.clipboard && window.isSecureContext) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+      document.body.removeChild(ta);
+      if (ok) resolve(); else reject(new Error('execCommand copy failed'));
+    });
+  }
+
+  // 用量窗口单元格：数值 + 迷你进度条 + 副行说明（副行用短时间，完整时间进 title）
+  function windowTd(used, cap, sub, subTitle) {
+    var cell = document.createElement('td');
+    cell.className = 'win';
+    var hasCap = typeof cap === 'number' && cap > 0;
+    var pct = hasCap ? Math.min(100, used / cap * 100) : 0;
+    var cls = hasCap && used >= cap ? 'over' : (pct >= 80 ? 'hot' : '');
+    var top = document.createElement('div');
+    top.className = 'wtop';
+    var u = document.createElement('span');
+    u.className = 'used';
+    u.textContent = hasCap ? fmt(used, 2) + ' / ' + fmt(cap, 2) : fmt(used, 2);
+    var p = document.createElement('span');
+    p.className = 'pct';
+    p.textContent = hasCap ? pct.toFixed(0) + '%' : '';
+    top.appendChild(u);
+    top.appendChild(p);
+    cell.appendChild(top);
+    var bar = document.createElement('div');
+    bar.className = 'bar ' + cls;
+    var fill = document.createElement('i');
+    fill.style.width = pct + '%';
+    bar.appendChild(fill);
+    cell.appendChild(bar);
+    if (sub) {
+      var s = document.createElement('div');
+      s.className = 'wsub';
+      s.textContent = sub;
+      if (subTitle) s.title = subTitle;
+      cell.appendChild(s);
+    }
+    return cell;
+  }
+
+  function naTd() {
+    var c = document.createElement('td');
+    c.className = 'num na';
+    c.textContent = '–';
+    return c;
+  }
+
+  function numTd(txt, hi) {
+    var c = document.createElement('td');
+    c.className = 'num' + (hi ? ' hi' : '');
+    c.textContent = txt;
+    return c;
   }
 
   function render(data) {
@@ -3589,30 +3700,41 @@ const ADMIN_PAGE_HTML = `<!doctype html>
     document.getElementById('st-monthly').textContent = monthly.toFixed(3);
     document.getElementById('st-free').textContent = free.toFixed(3);
 
-    var cards = document.getElementById('cards');
-    cards.innerHTML = '';
+    var tb = document.getElementById('tb');
+    tb.innerHTML = '';
     document.getElementById('empty').hidden = keys.length > 0;
+    document.getElementById('tablewrap').hidden = keys.length === 0;
 
     keys.forEach(function (k) {
-      var card = document.createElement('div');
-      card.className = 'card' + (k.ok ? '' : ' err');
+      var tr = document.createElement('tr');
+      if (!k.ok) tr.className = 'rowerr';
 
-      var head = document.createElement('div');
-      head.className = 'card-head';
+      // 状态灯
+      var tdLed = document.createElement('td');
       var led = document.createElement('span');
       led.className = 'led' + (k.ok ? '' : ' err');
-      head.appendChild(led);
+      tdLed.appendChild(led);
+      tr.appendChild(tdLed);
+
+      // 名称 + 备注
+      var tdNm = document.createElement('td');
+      var box = document.createElement('div');
+      box.className = 'nmcell';
       var nm = document.createElement('span');
       nm.className = 'nm';
       nm.textContent = k.name || '(未命名)';
+      box.appendChild(nm);
       if (k.note) {
         var note = document.createElement('span');
         note.className = 'note';
         note.textContent = k.note;
-        nm.appendChild(note);
+        box.appendChild(note);
       }
-      head.appendChild(nm);
-      // 套餐计划徽章
+      tdNm.appendChild(box);
+      tr.appendChild(tdNm);
+
+      // 套餐徽章
+      var tdPlan = document.createElement('td');
       if (k.plan) {
         var pbadge = document.createElement('span');
         pbadge.className = 'plan-badge';
@@ -3622,83 +3744,112 @@ const ADMIN_PAGE_HTML = `<!doctype html>
           pbadge.textContent += ' · ' + k.subscriptionStatus;
         }
         if (k.plan.monthlyCredits != null) pbadge.title = '月含 $' + k.plan.monthlyCredits;
-        head.appendChild(pbadge);
+        tdPlan.appendChild(pbadge);
       } else if (k.subscriptionError) {
-        var pbadge = document.createElement('span');
-        pbadge.className = 'plan-badge muted';
-        pbadge.textContent = '套餐获取失败';
-        pbadge.title = k.subscriptionError;
-        head.appendChild(pbadge);
+        var pbadgeErr = document.createElement('span');
+        pbadgeErr.className = 'plan-badge muted';
+        pbadgeErr.textContent = '套餐获取失败';
+        pbadgeErr.title = k.subscriptionError;
+        tdPlan.appendChild(pbadgeErr);
+      } else {
+        tdPlan.className = 'na';
+        tdPlan.textContent = '–';
       }
-      var keyid = document.createElement('span');
-      keyid.className = 'keyid';
-      keyid.textContent = k.keyMasked || k.keyHash;
-      keyid.title = 'Key Hash: ' + k.keyHash;
-      head.appendChild(keyid);
-      card.appendChild(head);
+      tr.appendChild(tdPlan);
 
-      var body = document.createElement('div');
-      body.className = 'card-body';
+      // Key 掩码
+      var tdKey = document.createElement('td');
+      tdKey.className = 'keyid';
+      tdKey.textContent = k.keyMasked || k.keyHash;
+      tdKey.title = 'Key Hash: ' + k.keyHash;
+      tr.appendChild(tdKey);
 
       if (!k.ok) {
+        // 查询失败：错误文本跨额度与窗口列单行展示，其余列留 "–"，保持行高一致
+        var tdErr = document.createElement('td');
+        tdErr.colSpan = 4;
         var eb = document.createElement('div');
-        eb.className = 'errbox';
+        eb.className = 'ecell';
         eb.textContent = '查询失败 [' + (k.status || 'ERR') + '] ' + (k.error || '');
-        body.appendChild(eb);
+        eb.title = eb.textContent;
+        tdErr.appendChild(eb);
+        tr.appendChild(tdErr);
+        tr.appendChild(naTd());
+        tr.appendChild(naTd());
       } else {
         var c = k.credits || {};
         var w = k.windowLimits || {};
-        var cr = document.createElement('div');
-        cr.className = 'credits';
-        var mk = function (cls, lb, num) {
-          var d = document.createElement('div');
-          d.className = 'cr' + (cls ? ' ' + cls : '');
-          var l = document.createElement('div'); l.className = 'lb'; l.textContent = lb;
-          var n = document.createElement('div'); n.className = 'num'; n.textContent = num;
-          d.appendChild(l); d.appendChild(n);
-          return d;
-        };
-        cr.appendChild(mk('main', 'Monthly', fmt(c.monthlyCredits)));
-        cr.appendChild(mk('', 'Purchased', fmt(c.purchasedCredits)));
-        cr.appendChild(mk('', 'Free', fmt(c.freeCredits)));
-        body.appendChild(cr);
+        tr.appendChild(numTd(fmt(c.monthlyCredits), true));
+        tr.appendChild(numTd(fmt(c.purchasedCredits)));
+        tr.appendChild(numTd(fmt(c.freeCredits)));
+
         // 月度窗口（套餐周期用量）——官方口径：已用/(max(套餐月额,剩余)+已购+免费)
         if (k.monthly) {
           var m = k.monthly;
           var mCap = m.pool > 0 ? m.pool : null;
-          var mReset = k.periodEnd ? fmtTime(k.periodEnd) : null;
-          var mPct = mCap ? Math.min(100, m.pct) : 0;
-          var mCls = mCap && m.used >= mCap ? 'over' : (mPct >= 80 ? 'hot' : '');
-          var mUsedTxt = mCap != null ? fmt(m.used, 2) + ' / ' + fmt(mCap, 2) : fmt(m.used, 2);
-          var mm = document.createElement('div');
-          mm.className = 'meter';
-          mm.innerHTML = '<div class="mrow"><span>' + esc('月度窗口' + (k.plan ? ' · ' + esc(k.plan.name) : '')) + '</span>' +
-            '<span>已用 <b>' + mUsedTxt + '</b></span></div>' +
-            '<div class="bar ' + mCls + '"><i style="width:' + mPct + '%"></i></div>' +
-            '<div class="meta"><span>' + (mReset ? '周期至 ' + mReset + (k.daysLeft != null ? '（剩 ' + k.daysLeft + ' 天）' : '') : '周期信息不可用') +
-            '</span><span>' + (mCap ? mPct.toFixed(0) + '%' : '') + '</span></div>';
-          body.appendChild(mm);
+          var mSub = k.periodEnd
+            ? '至 ' + fmtDateShort(k.periodEnd) + (k.daysLeft != null ? '（剩 ' + k.daysLeft + ' 天）' : '')
+            : '周期信息不可用';
+          tr.appendChild(windowTd(m.used, mCap, mSub, k.periodEnd ? '周期至 ' + fmtTime(k.periodEnd) : undefined));
         } else if (k.summaryError) {
-          var me = document.createElement('div');
-          me.className = 'meta';
-          me.style.cssText = 'padding:8px 0 2px;color:var(--warn)';
-          me.textContent = '月度窗口获取失败（summary 接口 ' + k.summaryError + '）';
-          body.appendChild(me);
+          var tdSum = document.createElement('td');
+          tdSum.className = 'win';
+          var se = document.createElement('div');
+          se.className = 'wsub warn';
+          se.textContent = 'summary 接口 ' + k.summaryError;
+          tdSum.appendChild(se);
+          tr.appendChild(tdSum);
+        } else {
+          tr.appendChild(naTd());
         }
-        if (w.fiveHour) body.insertAdjacentHTML('beforeend', meter('5H 窗口', w.fiveHour.used, w.fiveHour.cap, w.fiveHour.resetAt));
-        if (w.weekly) body.insertAdjacentHTML('beforeend', meter('Weekly 窗口', w.weekly.used, w.weekly.cap, w.weekly.resetAt));
-      }
-      card.appendChild(body);
 
-      var foot = document.createElement('div');
-      foot.className = 'card-foot';
-      var when = document.createElement('span');
-      when.style.cssText = 'color:var(--muted);font-family:var(--mono);font-size:10.5px';
-      when.textContent = '更新 ' + fmtAgo(k.at);
-      foot.appendChild(when);
+        // 5H / Weekly 滚动窗口
+        if (w.fiveHour) {
+          tr.appendChild(windowTd(w.fiveHour.used, w.fiveHour.cap, '重置 ' + fmtTimeShort(w.fiveHour.resetAt), '重置 ' + fmtTime(w.fiveHour.resetAt)));
+        } else {
+          tr.appendChild(naTd());
+        }
+        if (w.weekly) {
+          tr.appendChild(windowTd(w.weekly.used, w.weekly.cap, '重置 ' + fmtTimeShort(w.weekly.resetAt), '重置 ' + fmtTime(w.weekly.resetAt)));
+        } else {
+          tr.appendChild(naTd());
+        }
+      }
+
+      // 更新时间
+      var tdWhen = document.createElement('td');
+      tdWhen.className = 'when';
+      tdWhen.textContent = fmtAgo(k.at);
+      tdWhen.title = '更新于 ' + fmtTime(k.at);
+      tr.appendChild(tdWhen);
+
+      // 操作
+      var tdOp = document.createElement('td');
+      var opbox = document.createElement('div');
+      opbox.className = 'opcell';
+
+      var cp = document.createElement('button');
+      cp.className = 'btn ghost rowdel';
+      cp.textContent = '复制';
+      cp.title = '复制完整 Key 到剪贴板';
+      cp.addEventListener('click', function () {
+        cp.disabled = true;
+        post({ action: 'reveal', keyHash: k.keyHash }, function (r) {
+          cp.disabled = false;
+          if (!r || !r.key) return;
+          copyText(r.key).then(function () {
+            cp.textContent = '已复制';
+            setStatus('已复制 ' + (k.name || '') + ' 的 Key', 'ok');
+            setTimeout(function () { cp.textContent = '复制'; }, 1600);
+          }).catch(function () {
+            setStatus('复制失败：浏览器拒绝写入剪贴板', 'err');
+          });
+        });
+      });
+      opbox.appendChild(cp);
+
       var del = document.createElement('button');
-      del.className = 'btn danger';
-      del.style.cssText = 'margin-left:auto;padding:5px 12px;font-size:12px';
+      del.className = 'btn danger rowdel';
       del.textContent = '删除';
       del.addEventListener('click', function () {
         if (!confirm('删除 Key ' + (k.name || '') + ' ？此操作只移除本地监控，不影响账号。')) return;
@@ -3706,9 +3857,12 @@ const ADMIN_PAGE_HTML = `<!doctype html>
           if (r && r.ok) { setStatus('已删除', 'ok'); load(true); }
         });
       });
-      foot.appendChild(del);
-      card.appendChild(foot);
-      cards.appendChild(card);
+      opbox.appendChild(del);
+
+      tdOp.appendChild(opbox);
+      tr.appendChild(tdOp);
+
+      tb.appendChild(tr);
     });
   }
 
@@ -3725,7 +3879,8 @@ const ADMIN_PAGE_HTML = `<!doctype html>
         return d;
       });
     }).then(function (d) {
-      if (!d) return;
+      // 401/403 已在上面处理过，这里仍要回调，否则调用方按钮会永久停在禁用态
+      if (!d) { cb(null); return; }
       if (d.error) { alert('操作失败：' + d.error); cb(null); return; }
       cb(d);
     }).catch(function () { alert('网络错误'); cb(null); });
