@@ -7,5 +7,6 @@
   "logFile": "",
   "logLevel": "info",
   "zdr": false,
-  "adminPassword": ""
+  "adminPassword": "",
+  "upstreamProxy": ""
 }
