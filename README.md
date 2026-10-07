@@ -100,6 +100,7 @@ commandcode/
 | `KEYS_FILE` | `keys.json` | Key pool storage path → `keysFile` |
 | `CC_ADMIN_TIMEOUT_MS` | `20000` | Admin panel per-request upstream timeout in ms |
 | `CC_ADMIN_CONCURRENCY` | `4` | Admin panel upstream concurrency cap |
+| `CC_REQUEST_LOG` | unset (off) | Set to `1` to log one line per request when it ends: `bodyBytes` (request body size), `images`/`imageBytes` (count and bytes of images), `msgs`, `totalMs`, `status`, `completed`. Useful for "how big was that request / why did it stall"; zero overhead when off (the body is not scanned) |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header

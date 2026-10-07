@@ -1151,6 +1151,54 @@ function mapCcEventError(event) {
 
 // ── HTTP 请求处理 ──────────────────────────────────
 
+// ── 请求级日志（可选，CC_REQUEST_LOG=1 开启）──────────
+// 每个请求在结束时输出一行：请求体字节数、其中图片的数量与字节、消息条数、
+// 是否流式、耗时、HTTP 状态码，以及响应是否写完整（completed）。
+// 默认关闭（每请求会多出一行日志）。
+// 排查「某笔请求为什么卡住 / 到底发了多大」时开启，可把线上请求的实际体积照出来。
+const REQUEST_LOG = process.env.CC_REQUEST_LOG === '1';
+
+// 扫描原始 body 里的图片 data URL，统计数量与总字节；仅在开启日志时才执行
+function imageStatsIn(raw) {
+  let count = 0;
+  let bytes = 0;
+  const re = /data:image\/[a-zA-Z0-9.+-]+;base64,/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    count++;
+    const start = m.index + m[0].length;
+    const end = raw.indexOf('"', start);
+    bytes += (end > start ? end : raw.length) - start;
+  }
+  return { count, bytes };
+}
+
+// 在 handler 入口调用；返回的对象供 handler 补 model / key / msgs 等字段，
+// 关闭日志时返回 null（调用方用 if (rl) 保护，零开销）。
+function beginRequestLog(req, res, pathName) {
+  if (!REQUEST_LOG) return null;
+  const t0 = Date.now();
+  const info = { model: null, key: null, msgs: null, stream: null };
+  res.on('close', () => {
+    const s = req._reqStats || {};
+    log('info', 'Request', {
+      path: pathName,
+      model: info.model,
+      key: info.key,
+      msgs: info.msgs,
+      stream: info.stream,
+      bodyBytes: s.bodyBytes ?? 0,
+      images: s.count ?? 0,
+      imageBytes: s.bytes ?? 0,
+      totalMs: Date.now() - t0,
+      status: res.statusCode,
+      // 响应是否写完整；false 表示客户端提前断开或进程中断，与 status 配合判读
+      completed: !!res.writableEnded,
+    });
+  });
+  return info;
+}
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -1182,7 +1230,10 @@ function readBody(req) {
     req.on('end', () => {
       if (settled) return;
       settled = true;
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString())); }
+      const raw = Buffer.concat(chunks).toString();
+      // 仅在开启请求日志时做统计，避免常态下的额外扫描开销
+      if (REQUEST_LOG) req._reqStats = { bodyBytes: totalSize, ...imageStatsIn(raw) };
+      try { resolve(JSON.parse(raw)); }
       catch { reject(new Error('Invalid JSON')); }
     });
     req.on('error', e => { if (!settled) { settled = true; reject(e); } });
@@ -1447,6 +1498,7 @@ async function forwardToCC(body, apiKey, incomingHeaders = {}, signal, promptCac
 // ── 路由 ────────────────────────────────────────────
 
 async function handleChatCompletions(req, res) {
+  const rl = beginRequestLog(req, res, '/v1/chat/completions');
   let openaiReq;
   try {
     openaiReq = await readBody(req);
@@ -1467,6 +1519,12 @@ async function handleChatCompletions(req, res) {
 
   const stream = openaiReq.stream === true;
   const model = openaiReq.model || 'deepseek/deepseek-v4-flash';
+  if (rl) {
+    rl.model = model;
+    rl.stream = stream;
+    rl.key = apiKey.slice(0, 12);
+    rl.msgs = Array.isArray(openaiReq.messages) ? openaiReq.messages.length : 0;
+  }
   const completionId = `chatcmpl-${randomUUID().slice(0, 12)}`;
   const created = nowUnix();
 
@@ -2456,6 +2514,7 @@ function sendAnthropicError(res, status, type, message, retryAfter) {
 }
 
 async function handleMessages(req, res) {
+  const rl = beginRequestLog(req, res, '/v1/messages');
   let anthropicReq;
   try {
     anthropicReq = await readBody(req);
@@ -2476,6 +2535,12 @@ async function handleMessages(req, res) {
 
   const stream = anthropicReq.stream === true;
   const model = anthropicReq.model || 'claude-sonnet-4-6';
+  if (rl) {
+    rl.model = model;
+    rl.stream = stream;
+    rl.key = apiKey.slice(0, 12);
+    rl.msgs = Array.isArray(anthropicReq.messages) ? anthropicReq.messages.length : 0;
+  }
 
   // Convert Anthropic → OpenAI → CC
   const openaiReq = convertAnthropicToOpenAI(anthropicReq);
@@ -3400,6 +3465,7 @@ function createResponsesSseTranslator(model, responseId, created) {
 }
 
 async function handleResponses(req, res) {
+  const rl = beginRequestLog(req, res, '/v1/responses');
   let respReq;
   try {
     respReq = await readBody(req);
@@ -3430,6 +3496,12 @@ async function handleResponses(req, res) {
 
   const stream = chatReq.stream === true;
   const model = chatReq.model || 'deepseek/deepseek-v4-flash';
+  if (rl) {
+    rl.model = model;
+    rl.stream = stream;
+    rl.key = apiKey.slice(0, 12);
+    rl.msgs = Array.isArray(chatReq.messages) ? chatReq.messages.length : 0;
+  }
   const responseId = newResponsesId('resp_');
   const created = nowUnix();
   const echoOpts = {

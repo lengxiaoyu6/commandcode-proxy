@@ -100,6 +100,7 @@ commandcode/
 | `KEYS_FILE` | `keys.json` | Key 池存储路径 → `keysFile` |
 | `CC_ADMIN_TIMEOUT_MS` | `20000` | 管理页单个上游查询超时（毫秒）|
 | `CC_ADMIN_CONCURRENCY` | `4` | 管理页发往上游的并发上限 |
+| `CC_REQUEST_LOG` | 空（关闭）| 设为 `1` 开启请求级日志：每个请求结束时输出一行，含 `bodyBytes`（请求体字节）、`images`/`imageBytes`（图片数量与字节）、`msgs`、`totalMs`、`status`、`completed`。排查「某笔请求到底发了多大 / 为什么卡住」时开启；关闭时零开销（不扫描请求体）|
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
