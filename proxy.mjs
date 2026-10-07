@@ -8,7 +8,7 @@ import tls from 'tls';
 import { Readable } from 'stream';
 import crypto from 'crypto';
 import { randomUUID } from 'crypto';
-import { readFileSync, existsSync, appendFileSync, writeFileSync } from 'fs';
+import { readFileSync, existsSync, appendFileSync, appendFile, writeFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -1151,12 +1151,20 @@ function mapCcEventError(event) {
 
 // ── HTTP 请求处理 ──────────────────────────────────
 
-// ── 请求级日志（可选，CC_REQUEST_LOG=1 开启）──────────
+// ── 请求级日志（可选）────────────────────────────────
 // 每个请求在结束时输出一行：请求体字节数、其中图片的数量与字节、消息条数、
 // 是否流式、耗时、HTTP 状态码，以及响应是否写完整（completed）。
-// 默认关闭（每请求会多出一行日志）。
 // 排查「某笔请求为什么卡住 / 到底发了多大」时开启，可把线上请求的实际体积照出来。
-const REQUEST_LOG = process.env.CC_REQUEST_LOG === '1';
+// 开启方式（任一即可）：
+//   CC_REQUEST_LOG=1                     → 只打到 stdout（docker logs 可查）
+//   CC_REQUEST_LOG_FILE=/app/data/requests.jsonl → 额外落盘为 JSONL，便于长期收集
+// 直接给 CC_REQUEST_LOG_FILE 也会自动开启。关闭时零开销（不扫描请求体）。
+//
+// 请求日志的落盘文件（可选）。每行一条 JSON，便于事后分析。
+// 用异步 appendFile 而非 log() 那条同步写路径 —— 请求日志是高频的，同步写会阻塞事件循环。
+// 容器里记得指向挂载卷，否则重建容器会丢。
+const REQUEST_LOG_FILE = process.env.CC_REQUEST_LOG_FILE || '';
+const REQUEST_LOG = process.env.CC_REQUEST_LOG === '1' || REQUEST_LOG_FILE !== '';
 
 // 扫描原始 body 里的图片 data URL，统计数量与总字节；仅在开启日志时才执行
 function imageStatsIn(raw) {
@@ -1181,7 +1189,8 @@ function beginRequestLog(req, res, pathName) {
   const info = { model: null, key: null, msgs: null, stream: null };
   res.on('close', () => {
     const s = req._reqStats || {};
-    log('info', 'Request', {
+    const rec = {
+      ts: new Date().toISOString(),
       path: pathName,
       model: info.model,
       key: info.key,
@@ -1194,7 +1203,12 @@ function beginRequestLog(req, res, pathName) {
       status: res.statusCode,
       // 响应是否写完整；false 表示客户端提前断开或进程中断，与 status 配合判读
       completed: !!res.writableEnded,
-    });
+    };
+    if (REQUEST_LOG_FILE) {
+      // 异步追加，失败静默（日志不该影响请求本身）
+      try { appendFile(REQUEST_LOG_FILE, JSON.stringify(rec) + '\n', () => {}); } catch {}
+    }
+    log('info', 'Request', rec);
   });
   return info;
 }

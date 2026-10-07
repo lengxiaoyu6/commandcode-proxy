@@ -101,6 +101,7 @@ commandcode/
 | `CC_ADMIN_TIMEOUT_MS` | `20000` | 管理页单个上游查询超时（毫秒）|
 | `CC_ADMIN_CONCURRENCY` | `4` | 管理页发往上游的并发上限 |
 | `CC_REQUEST_LOG` | 空（关闭）| 设为 `1` 开启请求级日志：每个请求结束时输出一行，含 `bodyBytes`（请求体字节）、`images`/`imageBytes`（图片数量与字节）、`msgs`、`totalMs`、`status`、`completed`。排查「某笔请求到底发了多大 / 为什么卡住」时开启；关闭时零开销（不扫描请求体）|
+| `CC_REQUEST_LOG_FILE` | 空（关闭）| 请求日志落盘路径（如 `/app/data/requests.jsonl`），每行一条 JSON 便于事后分析；**设了它就自动开启**请求日志，无需再设 `CC_REQUEST_LOG`。容器内请指向挂载卷，且注意该文件不会自动轮转 |
 
 开启后，代理会在 Command Code 生成请求以及 fingerprint/lifecycle 初始化请求中附加
 `x-cmd-zdr: 1`。npm 版本检查和代理自己的 `/provider/v1/models` 模型目录请求不会附加该
