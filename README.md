@@ -490,14 +490,14 @@ The Anthropic SDK authenticates via the `x-api-key` header — supported by the 
 
 ## Anti-Detection
 
-Aligned line-by-line against the official npm package source (`command-code@1.53.1`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
+Aligned line-by-line against the official npm package source (`command-code@1.76.0`; `dist/cli.mjs` is minified but **not obfuscated**). Newer npm releases only raise a drift **warning** — the proxy never silently bumps the version it claims:
 
 | Mechanism | Implementation |
 |-----------|---------------|
 | **Device Fingerprint** | `POST /alpha/fingerprint/record` before first request per key; signal values (Windows MachineGuid shape, real-shaped MACs, `DESKTOP-xxxxxx` hostname) are **derived deterministically from the API key** and hashed exactly like the CLI, so one key always reports the same device — across restarts, memory reclamation and multiple instances (bulk reset via `CC_FINGERPRINT_SALT`) |
 | **Lifecycle Events** | `POST /alpha/lifecycle-events` (`cli_session_exists`, metadata `{sessionId, cliVersion, mode, os}`) sent in parallel with the fingerprint on key init |
 | **Per-Key Session** | One session per API key, 12h expiry + 1h random jitter |
-| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.53.1`); newer npm releases only raise a drift **warning**, never a silent version bump |
+| **Version** | `x-command-code-version` reports the **protocol version actually implemented** (currently `1.76.0`); newer npm releases only raise a drift **warning**, never a silent version bump |
 | **CLI Envelope** | 9 keys: `config / memory / taste / skills / permissionMode / threadId / mode / promptCache / params` |
 | **OpenTelemetry** | `traceparent` (W3C Trace Context) |
 | **Environment** | `x-cli-environment: production`, `x-taste-learning: "false"`, `User-Agent: cli` |

@@ -68,7 +68,7 @@ function loadConfig() {
 
 const CFG = loadConfig();
 
-// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.53.1） ──────
+// ── 设备指纹（形态与哈希逐字对齐官方 CLI 1.76.0） ──────
 // CPU 型号与核心数对应表（仅 Windows x64）
 const FINGERPRINT_CPUS = [
   { model: '12th Gen Intel(R) Core(TM) i7-12650H', cores: 10 },   // TEMP-REVERT
@@ -193,11 +193,15 @@ function generateFingerprint(apiKey) {
   };
 }
 
-// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.53.1 源码）。
+// 本代理**实际实现**的 wire 协议版本（对齐 command-code@1.76.0 源码）。
+// 逐项核对记录（1.76.0，2026-10）：指纹盐仍为 `command-code:device-fingerprint:v1`；
+// 指纹字段集不变（thumbmark + 14 项 components，collectorVersion 为数字 1）；
+// 信封 9 键与 config 九字段不变；max_tokens 默认仍为 64000；请求头集合不变
+// （x-co-flag 已移除；x-cli-surface 仅 ACP/RPC 模式发送，普通 CLI 不发）。
 // 真机发的永远是「形状 + 版本号」自洽的组合；如果版本号跟着 npm 走而形状没变，
 // 就变成「自称最新版、却说旧方言」—— 这比版本号过期更容易被行为分析挑出来。
 // 因此这里报的是协议版本，npm 上更新了只告警、不自动改。
-const CC_PROTOCOL_VERSION = '1.53.1';
+const CC_PROTOCOL_VERSION = '1.76.0';
 let CC_VERSION = CC_PROTOCOL_VERSION;
 const CC_VERSION_REFRESH_MS = 24 * 60 * 60 * 1000; // 24h — 检查一次是否发生漂移
 
