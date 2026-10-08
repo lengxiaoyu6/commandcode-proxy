@@ -102,6 +102,7 @@ commandcode/
 | `CC_ADMIN_CONCURRENCY` | `4` | Admin panel upstream concurrency cap |
 | `CC_REQUEST_LOG` | unset (off) | Set to `1` to log one line per request when it ends: `bodyBytes` (request body size), `images`/`imageBytes` (count and bytes of images), `msgs`, `totalMs`, `status`, `completed`. Useful for "how big was that request / why did it stall"; zero overhead when off (the body is not scanned) |
 | `CC_REQUEST_LOG_FILE` | unset (off) | Path to dump the request log as JSONL (e.g. `/app/data/requests.jsonl`) for offline analysis; **setting it enables request logging by itself**, no need for `CC_REQUEST_LOG`. Point it at a mounted volume inside containers, and note the file does not rotate on its own |
+| (failure shape) | — | When a request ends with a non-200 status the record automatically gains a `shape` field: `roleSeq` (collapsed role sequence, e.g. `user,assistant,toolx3,user`), `roleCount`, `tools` (tool names seen), `toolCalls`, `sysChars`. Used to identify *which request contents* stall; **structure only — never message bodies**, and successful requests are not recorded |
 
 When enabled, the proxy sends `x-cmd-zdr: 1` on Command Code generation requests
 and the fingerprint/lifecycle initialization requests. It does not add the header

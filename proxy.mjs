@@ -1181,6 +1181,51 @@ function imageStatsIn(raw) {
   return { count, bytes };
 }
 
+// 请求结构摘要：只在请求以非 200 收尾时输出，用于定位「哪些内容会让上游卡死」。
+// 只记录结构特征 —— 角色序列、工具名、各类长度 —— 绝不记录任何消息正文。
+// 覆盖三种协议：messages(input) 在 chat/completions 与 messages 里叫 messages，
+// 在 responses 里叫 input。
+function summarizeShape(body) {
+  const msgs = Array.isArray(body?.messages) ? body.messages
+    : Array.isArray(body?.input) ? body.input
+      : [];
+  if (!msgs.length) return null;
+  const roles = [];
+  const toolNames = new Set();
+  let toolCalls = 0;
+  for (const m of msgs) {
+    if (!m || typeof m !== 'object') continue;
+    const r = m.role || m.type || '?';
+    const last = roles[roles.length - 1];
+    if (last && last.role === r) last.n++;
+    else roles.push({ role: r, n: 1 });
+
+    if (Array.isArray(m.tool_calls)) {
+      toolCalls += m.tool_calls.length;
+      for (const tc of m.tool_calls) {
+        const n = tc?.function?.name;
+        if (n) toolNames.add(String(n));
+      }
+    }
+    if (m.role === 'tool' && typeof m.name === 'string') toolNames.add(m.name);
+    if (typeof m.type === 'string' && /^(function_call|tool_use|computer_call)/.test(m.type)) {
+      if (typeof m.name === 'string') toolNames.add(m.name);
+      toolCalls++;
+    }
+  }
+  const sys = body?.system ?? body?.instructions;
+  const sysChars = typeof sys === 'string' ? sys.length
+    : Array.isArray(sys) ? sys.reduce((a, b) => a + (typeof b?.text === 'string' ? b.text.length : 0), 0)
+      : 0;
+  return {
+    roleSeq: roles.map(x => (x.n > 1 ? `${x.role}x${x.n}` : x.role)).join(',').slice(0, 800),
+    roleCount: msgs.length,
+    tools: [...toolNames].slice(0, 15),
+    toolCalls,
+    sysChars,
+  };
+}
+
 // 在 handler 入口调用；返回的对象供 handler 补 model / key / msgs 等字段，
 // 关闭日志时返回 null（调用方用 if (rl) 保护，零开销）。
 function beginRequestLog(req, res, pathName) {
@@ -1189,6 +1234,7 @@ function beginRequestLog(req, res, pathName) {
   const info = { model: null, key: null, msgs: null, stream: null };
   res.on('close', () => {
     const s = req._reqStats || {};
+    const failed = res.statusCode !== 200;
     const rec = {
       ts: new Date().toISOString(),
       path: pathName,
@@ -1204,6 +1250,9 @@ function beginRequestLog(req, res, pathName) {
       // 响应是否写完整；false 表示客户端提前断开或进程中断，与 status 配合判读
       completed: !!res.writableEnded,
     };
+    // 只在失败时附上结构摘要（角色序列 / 工具名 / 长度），用于定位必卡请求的共同特征。
+    // 正常请求不带，避免日志膨胀；摘要里不含任何消息正文。
+    if (failed && req._reqShape) rec.shape = req._reqShape;
     if (REQUEST_LOG_FILE) {
       // 异步追加，失败静默（日志不该影响请求本身）
       try { appendFile(REQUEST_LOG_FILE, JSON.stringify(rec) + '\n', () => {}); } catch {}
@@ -1245,10 +1294,15 @@ function readBody(req) {
       if (settled) return;
       settled = true;
       const raw = Buffer.concat(chunks).toString();
-      // 仅在开启请求日志时做统计，避免常态下的额外扫描开销
-      if (REQUEST_LOG) req._reqStats = { bodyBytes: totalSize, ...imageStatsIn(raw) };
-      try { resolve(JSON.parse(raw)); }
-      catch { reject(new Error('Invalid JSON')); }
+      let parsed;
+      try { parsed = JSON.parse(raw); }
+      catch { reject(new Error('Invalid JSON')); return; }
+      // 仅在开启请求日志时做统计与摘要，避免常态下的额外扫描开销
+      if (REQUEST_LOG) {
+        req._reqStats = { bodyBytes: totalSize, ...imageStatsIn(raw) };
+        try { req._reqShape = summarizeShape(parsed); } catch { req._reqShape = null; }
+      }
+      resolve(parsed);
     });
     req.on('error', e => { if (!settled) { settled = true; reject(e); } });
   });
